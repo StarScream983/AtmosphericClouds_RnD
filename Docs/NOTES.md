@@ -292,3 +292,125 @@ Update all 3 existing call sites: primary ray fine phase → `DetailLOD = 0.0`; 
 large scale planets create banding and blurry renders, i will attempt optimized progressive large steps, shouldn't take more performance, as steps will grow as raymarch through large distances.
 steps that increase in length according to distance from camera, we'll have to figure out the distance thresholds, far orbit close orbit, close clouds shell, mid range clouds shell, and far range clouds shell.
 all this is still cheap large steps, when we hit density, we go back one large step and start small steps for high detail texture sample, the exit when desity hits saturation or zero density for 10 small steps.
+
+#### COLLIN
+
+- Blue noise temporal dithering
+- Use blue noise dithering, static, not temporal
+- So `TAA`/`TSR` isn't usable, so you get a lot of flickering because no temporal accumulation
+
+Collin's explaining exactly the same mechanism we ran into ourselves earlier tonight. Breaking it down:
+
+**Blue noise** is a noise pattern engineered to avoid low-frequency clumping (unlike plain random/white noise) — when used to dither something, the error gets spread out evenly instead of forming visible clusters, so it reads as fine, even grain rather than blotches.
+
+**Temporal dithering** means using a different blue-noise pattern each frame (e.g. offset by frame number), specifically so that over many frames, `TAA`/`TSR`'s temporal accumulation (blending each frame with an exponential history of previous frames) averages all those slightly-different dither patterns together into something smooth — the banding gets hidden by diffusing it across time, not within a single frame.
+
+**Why it flickers for him:** `TAA`/`TSR` is what actually does that averaging. If you're writing a custom shader pass that outputs directly to `SceneColor` without going through the engine's normal `TAA`/`TSR` history buffer — which is exactly our own situation, confirmed earlier tonight — then every frame's differently-dithered result gets shown raw, with nothing blending consecutive frames together. There's no accumulation to smooth it out, so you just see the per-frame noise pattern changing, which reads as flicker instead of clean dithering.
+
+**Collin's suggested fix (static blue noise):** use the same blue-noise pattern every frame instead of varying it. It can't flicker anymore since nothing changes frame to frame, but you lose the "resolves into a perfectly smooth gradient over time" benefit — you'd see a fixed, static grain pattern overlaid on the banding permanently, in every frame, rather than banding that disappears. It's a real fix for flicker, at the cost of trading banding for visible (but stable) noise texture.
+
+This is exactly how custom effects handle it when they can't ride the engine's built-in `TAA`/`TSR`. You build a minimal version yourself:
+
+1. **A history buffer** — a persistent render target that survives across frames, storing last frame's output.
+2. **Reprojection** — since the camera moves, you can't just blend history and current pixel-for-pixel; you need to re-project last frame's buffer into this frame's screen space using the previous frame's view/projection matrices, so you're blending the same world position, not misaligned pixels (otherwise you get smearing/ghosting).
+3. **Per-frame jitter** — offset the sample position slightly each frame (sub-pixel), same idea as engine `TAA`, so consecutive frames sample slightly different points and accumulation actually gains resolution instead of just repeating the same value.
+4. **Exponential blend** — `Result = lerp(History, Current, ~0.05–0.1)`, so many frames' worth of samples contribute, which is what actually smooths banding/noise over time.
+
+This is real and buildable, but it's a genuinely bigger feature than anything we've done tonight — it needs a new persistent texture resource (C++ side, allocated and carried across frames, not just a shader tweak) plus the reprojection math, not something that fits in a quick `.usf` edit.
+
+Reprojection is the core mechanism inside both. Here's how they use it: every frame, `TAA`/`TSR` jitters the camera projection by a sub-pixel offset, renders the frame, then takes last frame's accumulated history buffer and reprojects it into the current frame's screen space using per-pixel motion vectors (so a point on a moving object, or the camera turning, still lines up with where that same surface point is now). Then it blends the reprojected history with the new frame, with some rejection/clamping logic for places where the reprojection breaks down (disocclusion, fast motion, newly revealed geometry). `TSR` adds more sophisticated upsampling on top but the reprojection step is the same fundamental idea.
+
+So what you'd already planned to build is literally the same core technique the engine's own `TAA`/`TSR` uses internally — you just wouldn't get their rejection/clamping heuristics or motion-vector infrastructure for free, since our custom pass sits outside that pipeline.
+
+#### GOALS:
+
+find the high threshold: from which 54 to 96 steps look good from orbit
+find the low threshold: that will have the lowest cheap steps (before switching to high detailed steps), this would be YVAN's stepping scale
+define stepping sizes with a concept called Nyquist-style bound
+
+---
+
+```c
+
+// Returns the step size for whichever of NumSegments distance bands InDistance falls into,
+// growing geometrically from InLow (at InNear) to InHigh (at InFar) — Ratio is computed so
+// exactly NumSegments steps of growth land precisely on InHigh, whatever it actually is per
+// ray/frame (SegmentLength/StepCount isn't a fixed number), instead of a hardcoded ceiling.
+float LadderStepSize(float InDistance, float InLow, float InHigh, float InNear, float InFar, int NumSegments)
+{
+    const float DistanceFraction = saturate((InDistance - InNear) / (InFar - InNear));
+    const int Segment = min((int)(DistanceFraction * (float)NumSegments), NumSegments - 1);
+    const float Ratio = pow(InHigh / InLow, 1.0 / (float)NumSegments);
+    return InLow * pow(Ratio, (float)Segment);
+}
+
+// main
+// Adaptive step length: small near the camera (YVAN's scale), growing toward the existing
+// orbit-scale step size as t (distance from camera along this ray) increases. Switches to
+// fixed fine steps + high-detail LOD texture once density is found. No real density sampling
+// here — SampleDensity() is a placeholder.
+
+const float LowThreshCheapStepSize = 1000.0;              // YVAN's OrgStepSize (UU) — smallest coarse step
+const float HighThreshCheapStepSize = SegmentLength / StepCount; // existing orbit-scale formula (54-96 steps)
+const float FineStepSize = ...;                           // fixed, small — paired with high-detail LOD sampling
+
+// TODO (see GOALS above): tune these two. This is the absolute distance-from-camera range
+// over which step size grows from Low to High — NOT segment-relative (t / SegmentLength).
+// Two rays can share a SegmentLength for unrelated reasons (grazing vs. straight-down), so
+// the blend has to be driven by real distance, not position-within-this-ray's-own-segment.
+const float NearDistanceThreshold = 900000.; // below this, step size = LowThresh
+const float FarDistanceThreshold = 153000000.;  // at/above this, step size = HighThresh
+
+float t = tRaymarchEnter;
+bool bFineStepping = false;
+int ZeroDensityHitCount = 0;
+float AccumDensity = 0.0;
+
+int Iteration = 0;
+const int MaxIterations = ...; // safety net, independent of t
+
+for (; t < tRaymarchExit && Iteration < MaxIterations; Iteration++)
+{
+    float StepSize;
+    if (bFineStepping)
+    {
+        StepSize = FineStepSize;
+    }
+    else
+    {
+        StepSize = LadderStepSize(t, LowThreshCheapStepSize, HighThreshCheapStepSize, NearDistanceThreshold, FarDistanceThreshold, 10);
+    }
+
+    float Density = SampleDensity(t); // placeholder — no real density function here
+
+    if (Density > 0.0)
+    {
+        if (!bFineStepping)
+        {
+            // First hit while coarse-stepping: step back one coarse step, switch to fine +
+            // high-detail LOD texture sample.
+            t -= StepSize;
+            bFineStepping = true;
+            continue;
+        }
+
+        ZeroDensityHitCount = 0;
+        AccumDensity += Density;
+        if (AccumDensity > 0.99)
+        {
+            break; // saturated — fully opaque, stop marching entirely
+        }
+    }
+    else if (bFineStepping)
+    {
+        ZeroDensityHitCount++;
+        if (ZeroDensityHitCount >= 10)
+        {
+            // Walked out of the cloud — revert to coarse, resume the distance-based blend.
+            bFineStepping = false;
+        }
+    }
+
+    t += StepSize;
+}
+```
