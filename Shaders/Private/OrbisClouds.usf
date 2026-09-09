@@ -79,7 +79,7 @@ float Powder(float OpticalDepth)
 // Defined here (not in OrbisClouds.ush) so it can reference BaseShapeNoiseTexture/BaseShapeNoiseSampler
 // directly as globals — OrbisClouds.ush is #included above the texture global declarations, so a function
 // living there can't see them without passing them in as parameters every call.
-float ComputeDensityAt(
+float CloudIsoVolumeLowRes(
 	float3 SamplePosition,
 	float InnerRadius,
 	float2 WeatherMap,
@@ -140,6 +140,42 @@ float ComputeDensityAt(
 	Density = Remap(Density, ErosionThreshold, 1.0, 0.0, 1.0);
 
 	return Density;
+}
+
+// cloudHiRes equivalent (Project-Marshmallow compute-clouds.comp, cloudHiRes — fetched directly from the
+// real repo source and verified verbatim before implementing, not recalled from memory). Takes the already
+// -computed low-res Density and refines it using a SEPARATE, higher-frequency texture (DetailNoiseTexture)
+// — same 3-channel weighted erosion pattern as CloudIsoVolumeLowRes's own erosion, plus his height-based
+// inversion (`mix(erosion, 1-erosion, clamp(relativeHeight*10,0,1))`): erosion carves one way near the
+// shell base, the opposite way higher up, instead of one uniform pattern everywhere.
+// Not implemented: his curl-noise domain warp (`pos += 1.9*curlStrength*curl` before sampling) — we don't
+// have a curl-noise texture asset yet. Straight (unwarped) sampling only, for now.
+float CloudHighRes(float3 SamplePosition, float OrigDensity, float HeightGradient)
+{
+	if (bHasDetailNoiseTexture == 0u)
+	{
+		return OrigDensity;
+	}
+
+	// BaseShapeWorldSpan/8: derived so DetailNoiseTexture's finest Worley component (effective 16 cells,
+	// CellCount=2 in TextureAuthoringComponent.cpp) reads finer than BaseShapeNoiseTexture's own finest
+	// erosion component (effective 64 cells, CellCount=4) — verified against the actual generation code,
+	// not guessed.
+	const float DetailShapeWorldSpan = BaseShapeWorldSpan * 24.; // 8.0;
+	const float DetailFrequency = 1.0 / DetailShapeWorldSpan;
+	const float4 DetailNoise = Texture3DSample(DetailNoiseTexture, DetailNoiseSampler, SamplePosition * DetailFrequency);
+
+	float Erosion = 0.625 * DetailNoise.x + 0.25 * DetailNoise.y + 0.125 * DetailNoise.z;
+	Erosion = lerp(Erosion, 1.0 - Erosion, saturate(HeightGradient * 10.0));
+
+	// Was: Remap(OrigDensity, Erosion, 1.0, 0.0, 1.0) — Marshmallow's verbatim formula, using the raw
+	// Erosion value directly as the carve threshold. That's tuned to his own coverage model (height-biased);
+	// ours is mostly flat, which is exactly why CloudIsoVolumeLowRes's own erosion needed the same kind of
+	// dampening (ErosionStrength = 0.15) after the raw value collapsed almost all coverage down to a few
+	// islands. CloudHighRes never got that treatment when copied verbatim — undampened, it was shredding
+	// the shape into sparse noise instead of adding fine detail. Same dampening constant as the low-res pass.
+	const float HiResErosionStrength = 0.15;
+	return Remap(OrigDensity, Erosion * HiResErosionStrength, 1.0, 0.0, 1.0);
 }
 
 void MainPS(
@@ -266,7 +302,7 @@ void MainPS(
 		// TEMPORARY DEBUG: green = bHasBaseShapeNoiseTexture is 1 (texture actually seen by the shader), red
 		// = 0 (texture not seen, even though it's assigned in the editor) — isolating whether the fallback
 		// density path is running because the texture genuinely isn't reaching the shader, vs some other bug
-		// in ComputeDensityAt itself once the texture is confirmed bound.
+		// in CloudIsoVolumeLowRes itself once the texture is confirmed bound.
 		OutColor = (bHasBaseShapeNoiseTexture != 0u) ? float4(0., 1., 0., 1.) : float4(1., 0., 0., 1.);
 		return;
 	case 5u:
@@ -292,8 +328,9 @@ void MainPS(
 		}
 
 		const int StepCount = FindStepCount(RayDirection, PlanetCenterRelative);
-		float StepSize = SegmentLength / StepCount;
 		const float ShellThickness = OuterRadius - InnerRadius;
+		const float OrgStepSize = SegmentLength / StepCount;
+		float StepSize = OrgStepSize;
 		// Was: the real YVAN Volume 11 analytic single-scattering integrator (Transmittance/AccumScattering,
 		// SigmaT-based) — reverted back to this Density-weighted average, since the analytic integral proved
 		// numerically unstable for our sparse/noisy density field (confirmed: saturate() turned per-step
@@ -315,11 +352,12 @@ void MainPS(
 		// t never advances and "t < tRaymarchExit" alone would loop forever (GPU hang / driver crash).
 		// Iteration always increases by exactly 1 regardless of what t does, so it guarantees the loop ends.
 		int Iteration = 0;
-		const int MaxIterations = StepCount;
-
-		// switching logic comes next.
-		// bool bZeroDensityHit = true;
-		// int ZeroDensityHitCount = 0;
+		// YVAN's fine-stepping (halve on hit, double on miss, both bounded relative to
+		// OrgStepSize) needs more iterations than a plain coarse-only march to actually resolve
+		// density once found — StepCount*4 matches the budget verified in our own earlier
+		// reconstruction of his MainCS loop.
+		const int MaxIterations = StepCount * 4;
+		int ZeroDensityHitCount = 0;
 
 		for (float t = tRaymarchEnter; t < tRaymarchExit && ShellThickness > 0.0 && Iteration < MaxIterations; t += StepSize, Iteration++)
 		{
@@ -359,22 +397,33 @@ void MainPS(
 				CloudsTypeLacunarity,
 				CloudsTypeGain);
 
-			const float Density = ComputeDensityAt(SamplePosition, InnerRadius, WeatherMap, HeightFromBottom, HeightGradient);
+			float Density = CloudIsoVolumeLowRes(SamplePosition, InnerRadius, WeatherMap, HeightFromBottom, HeightGradient);
 
 			if (Density > 0.0)
 			{
-				// ZeroDensityHitCount = 0;
-				// if (bZeroDensityHit)
-				// {
-				// 	// First hit while still coarse-stepping: step back one coarse step and switch to fine
-				// 	// resolution (0.3x). The for-loop's own increment (t += StepSize) runs right after this
-				// 	// continue, using the just-shrunk StepSize — so the next iteration re-approaches this
-				// 	// same point at fine resolution instead of accumulating the coarse-resolution sample.
-				// 	t -= StepSize;
-				// 	StepSize *= 0.3;
-				// 	bZeroDensityHit = false;
-				// 	continue;
-				// }
+				// YVAN's fine-stepping: halve the step size on a hit, floored at OrgStepSize/8 so it
+				// can't shrink forever. Done once here, unconditionally — was previously duplicated
+				// (halved once inside the step-back branch below, then again right after it).
+				const float PreviousStepSize = StepSize;
+				StepSize = max(StepSize / 2.0, OrgStepSize / 8.0);
+				ZeroDensityHitCount = 0;
+
+				// First hit while still fully coarse: this coarse step already overshot the true
+				// entry boundary by up to a full OrgStepSize (whatever's between the previous
+				// zero-density sample and here was never sampled at fine resolution). Step back
+				// and re-approach at the just-halved step instead of accumulating this coarse-
+				// resolution sample — the Marshmallow-style piece YVAN's own source doesn't do on
+				// its own.
+				if (PreviousStepSize == OrgStepSize)
+				{
+					t -= PreviousStepSize;
+					continue;
+				}
+
+				// Refine with the hi-res detail texture — only reached once genuinely in fine-
+				// stepping (the step-back case above already continued away), so the coarse search
+				// never pays for this extra cost.
+				Density = CloudHighRes(SamplePosition, Density, HeightGradient);
 
 				float DensityAlongLight = 0.0;
 				float3 LightSamplePosition = SamplePosition;
@@ -383,7 +432,15 @@ void MainPS(
 				{
 					const float LightRadius = length(LightSamplePosition);
 					const float LightHeightGradient = saturate((LightRadius - InnerRadius) / ShellThickness);
-					DensityAlongLight += ComputeDensityAt(LightSamplePosition, InnerRadius, WeatherMap, 0.0, LightHeightGradient);
+					// Marshmallow's own light loop (verified from source): test low-res first, and only
+					// where that's actually nonzero, refine with the hi-res detail texture and accumulate
+					// the refined result — not the raw low-res value.
+					float IsoVolumeTest = CloudIsoVolumeLowRes(LightSamplePosition, InnerRadius, WeatherMap, 0.0, LightHeightGradient);
+					if (IsoVolumeTest > 0.0)
+					{
+						float LightDensity = CloudHighRes(LightSamplePosition, IsoVolumeTest, LightHeightGradient);
+						DensityAlongLight += LightDensity;
+					}
 					LightSamplePosition += SunDirection * LightStepSize;
 				}
 
@@ -401,17 +458,21 @@ void MainPS(
 					break;
 				}
 			}
-			// else if (!bZeroDensityHit)
-			// {
-			// 	// Missed (zero density) while fine-stepping. 10 consecutive misses means we've walked out of
-			// 	// the cloud — revert to coarse resolution instead of continuing to fine-step through empty sky.
-			// 	ZeroDensityHitCount++;
-			// 	if (ZeroDensityHitCount >= 10)
-			// 	{
-			// 		bZeroDensityHit = true;
-			// 		StepSize /= 0.3;
-			// 	}
-			// }
+			else if (StepSize < OrgStepSize)
+			{
+				// Marshmallow-style gating on top of YVAN's doubling: a single miss doesn't start
+				// reverting to coarse. Without this, one brief internal gap inside an otherwise
+				// solid cloud mass (normal noise/erosion variation, not actually exiting the cloud)
+				// was enough to double back to full coarse resolution in ~3 misses, showing as a
+				// coarse silhouette bleeding through behind the finer-detailed foreground — "big
+				// cloud behind small cloud." Only start doubling after 10 consecutive misses, so
+				// brief internal gaps don't trigger it, only actually walking out of the cloud does.
+				ZeroDensityHitCount++;
+				if (ZeroDensityHitCount >= 10)
+				{
+					StepSize = min(StepSize * 2.0, OrgStepSize * 1.2);
+				}
+			}
 		}
 		// raymarch end -------------------------------------------------------------------------------
 

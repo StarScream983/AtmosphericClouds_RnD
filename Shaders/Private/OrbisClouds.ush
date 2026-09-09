@@ -292,7 +292,7 @@ float AccumulateShellOpticalDepth(
 	for (int StepIndex = 0; StepIndex < StepCount; StepIndex++)
 	{
 		const float t = tRaymarchEnter + (StepIndex + 0.5) * StepSize;
-		// OpticalDepth += ComputeDensityAt(t, RayDirection, PlanetCenter, InnerRadius, OuterRadius) * StepSize;
+		// OpticalDepth += SampleIsoVolumeDensityAt(t, RayDirection, PlanetCenter, InnerRadius, OuterRadius) * StepSize;
 	}
 
 	return OpticalDepth;
