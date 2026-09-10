@@ -1,0 +1,92 @@
+#include "/Engine/Public/Platform.ush"
+#include "/Plugin/OrbisClouds/Noise.ush"
+
+uint Resolution;
+float OuterRadius;
+float CloudCoverageNoiseScale;
+uint BaseNoiseType;
+uint NoiseSeed;
+float NoiseOutputMin;
+float NoiseOutputMax;
+int CloudsCoverageOctaves;
+float CloudsCoverageLacunarity;
+float CloudsCoverageGain;
+uint bCloudsCoverageUseWarp;
+float CloudsCoverageWarpStrength;
+int CloudsCoverageWarpOctaves;
+float CloudTypeNoiseScale;
+uint CloudTypeNoiseSeed;
+uint CloudTypeNoiseType;
+int CloudsTypeOctaves;
+float CloudsTypeLacunarity;
+float CloudsTypeGain;
+
+RWTexture2DArray<float2> OutCoverageMap;
+
+// Same formula CalculateWeatherMap (Noise.ush) uses live per-raymarch-sample in OrbisClouds.usf — duplicated
+// here rather than calling CalculateWeatherMap directly so this bake can't silently drift from a signature
+// change there without a compile error pointing at both call sites.
+float2 SampleCoverageAndType(float3 InnerSurfacePosition)
+{
+	const float PlanetDiameter = max(2.0 * OuterRadius, 1.0);
+
+	const float CoverageFrequency = CloudCoverageNoiseScale / PlanetDiameter;
+	const float3 CoverageSamplePosition = InnerSurfacePosition * CoverageFrequency;
+	const float3 WarpedCoveragePosition = bCloudsCoverageUseWarp != 0u
+											  ? WarpPosition3D(CoverageSamplePosition, BaseNoiseType, NoiseSeed, CloudsCoverageLacunarity, CloudsCoverageGain, CloudsCoverageWarpOctaves, CloudsCoverageWarpStrength)
+											  : CoverageSamplePosition;
+	const float CoverageNoise = SampleFbmNoise3D(WarpedCoveragePosition, CloudsCoverageOctaves, BaseNoiseType, NoiseSeed, CloudsCoverageLacunarity, CloudsCoverageGain);
+	const float Coverage = lerp(NoiseOutputMin, NoiseOutputMax, CoverageNoise * 0.5 + 0.5);
+
+	const float CloudTypeFrequency = CloudTypeNoiseScale / PlanetDiameter;
+	const float CloudTypeNoiseValue = SampleFbmNoise3D(
+		InnerSurfacePosition * CloudTypeFrequency,
+		CloudsTypeOctaves,
+		CloudTypeNoiseType,
+		CloudTypeNoiseSeed,
+		CloudsTypeLacunarity,
+		CloudsTypeGain);
+	const float CloudType = saturate(CloudTypeNoiseValue * 0.5 + 0.5);
+
+	return float2(Coverage, CloudType);
+}
+
+// Standard cube-face-index + [-1,1] UV -> direction. Face order/orientation only has to stay internally
+// consistent between this write and whatever samples the resulting cube texture later — it doesn't need to
+// match any particular external convention.
+float3 GetCubeDirection(uint Face, float2 FaceUV)
+{
+	switch (Face)
+	{
+	case 0:
+		return normalize(float3(1.0, -FaceUV.y, -FaceUV.x)); // +X
+	case 1:
+		return normalize(float3(-1.0, -FaceUV.y, FaceUV.x)); // -X
+	case 2:
+		return normalize(float3(FaceUV.x, 1.0, FaceUV.y)); // +Y
+	case 3:
+		return normalize(float3(FaceUV.x, -1.0, -FaceUV.y)); // -Y
+	case 4:
+		return normalize(float3(FaceUV.x, -FaceUV.y, 1.0)); // +Z
+	default:
+		return normalize(float3(-FaceUV.x, -FaceUV.y, -1.0)); // -Z
+	}
+}
+
+[numthreads(THREADGROUP_SIZE, THREADGROUP_SIZE, 1)]
+void MainCS(uint3 DispatchThreadId : SV_DispatchThreadID)
+{
+	if (DispatchThreadId.x >= Resolution || DispatchThreadId.y >= Resolution)
+	{
+		return;
+	}
+
+	const uint Face = DispatchThreadId.z;
+	// Texel center, mapped from [0, Resolution) to [-1, 1].
+	const float2 FaceUV = (float2(DispatchThreadId.xy) + 0.5) / float(Resolution) * 2.0 - 1.0;
+
+	const float3 Direction = GetCubeDirection(Face, FaceUV);
+	const float3 InnerSurfacePosition = Direction * OuterRadius;
+
+	OutCoverageMap[DispatchThreadId] = SampleCoverageAndType(InnerSurfacePosition);
+}

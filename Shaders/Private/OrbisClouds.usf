@@ -43,6 +43,13 @@ SamplerState DetailNoiseSampler;
 uint bHasBaseShapeNoiseTexture;
 uint bHasDetailNoiseTexture;
 
+// Baked Coverage(r)/Type(g) cube (CloudCoverageMap.usf) — replaces the live CalculateWeatherMap FBM+warp
+// call at every raymarch sample. WeatherMap only ever depends on direction from the planet center (not on
+// radius — every call site below samples at a fixed radius per direction), so indexing purely by direction
+// is exact, not an approximation.
+TextureCube CoverageMapTexture;
+SamplerState CoverageMapSampler;
+
 // Standard remap: rescales Value from the [OldMin, OldMax] range to [NewMin, NewMax], clamped.
 float Remap(float Value, float OldMin, float OldMax, float NewMin, float NewMax)
 {
@@ -244,51 +251,17 @@ void MainPS(
 	{
 	case 0u:
 	{
-		WeatherMap = CalculateWeatherMap(
-			OuterSurfacePosition,
-			OuterRadius,
-			CloudCoverageNoiseScale,
-			BaseNoiseType,
-			NoiseSeed,
-			NoiseOutputMin,
-			NoiseOutputMax,
-			CloudsCoverageOctaves,
-			CloudsCoverageLacunarity,
-			CloudsCoverageGain,
-			bCloudsCoverageUseWarp != 0u,
-			CloudsCoverageWarpStrength,
-			CloudsCoverageWarpOctaves,
-			CloudTypeNoiseScale,
-			CloudTypeNoiseType,
-			CloudTypeNoiseSeed,
-			CloudsTypeOctaves,
-			CloudsTypeLacunarity,
-			CloudsTypeGain);
+		// Was: a live CalculateWeatherMap(OuterSurfacePosition, OuterRadius, ...) call (8-octave Coverage FBM
+		// + 8-octave Type FBM + up to 6-octave warp) — now a lookup into the baked cube (CloudCoverageMap.usf),
+		// indexed by direction since WeatherMap only ever depends on direction from the planet center.
+		WeatherMap = TextureCubeSample(CoverageMapTexture, CoverageMapSampler, DirectionFromPlanetCenter).rg;
 		Color = WeatherMap.x;
 	}
 	break;
 	case 1u:
 	{
-		WeatherMap = CalculateWeatherMap(
-			OuterSurfacePosition,
-			OuterRadius,
-			CloudCoverageNoiseScale,
-			BaseNoiseType,
-			NoiseSeed,
-			NoiseOutputMin,
-			NoiseOutputMax,
-			CloudsCoverageOctaves,
-			CloudsCoverageLacunarity,
-			CloudsCoverageGain,
-			bCloudsCoverageUseWarp != 0u,
-			CloudsCoverageWarpStrength,
-			CloudsCoverageWarpOctaves,
-			CloudTypeNoiseScale,
-			CloudTypeNoiseType,
-			CloudTypeNoiseSeed,
-			CloudsTypeOctaves,
-			CloudsTypeLacunarity,
-			CloudsTypeGain);
+		// Was: same live CalculateWeatherMap(OuterSurfacePosition, OuterRadius, ...) call as case 0u above.
+		WeatherMap = TextureCubeSample(CoverageMapTexture, CoverageMapSampler, DirectionFromPlanetCenter).rg;
 		Color = WeatherMap.y;
 	}
 	break;
@@ -376,26 +349,13 @@ void MainPS(
 			const float3 DirectionFromPlanetCenterAtStep = ComputePreciseDirectionFromPlanetCenter(RayDirection, t, PlanetCenterRelativeDF);
 			const float3 SamplePosition = DirectionFromPlanetCenterAtStep * InnerRadius;
 
-			WeatherMap = CalculateWeatherMap(
-				SamplePosition,
-				OuterRadius,
-				CloudCoverageNoiseScale,
-				BaseNoiseType,
-				NoiseSeed,
-				NoiseOutputMin,
-				NoiseOutputMax,
-				CloudsCoverageOctaves,
-				CloudsCoverageLacunarity,
-				CloudsCoverageGain,
-				bCloudsCoverageUseWarp != 0u,
-				CloudsCoverageWarpStrength,
-				CloudsCoverageWarpOctaves,
-				CloudTypeNoiseScale,
-				CloudTypeNoiseType,
-				CloudTypeNoiseSeed,
-				CloudsTypeOctaves,
-				CloudsTypeLacunarity,
-				CloudsTypeGain);
+			// Was: a live CalculateWeatherMap(SamplePosition, OuterRadius, ...) call here, every single primary-
+			// ray sample (up to MaxIterations per pixel) — the actual bottleneck that made close-up views
+			// unusably slow, per-sample 8-octave Coverage FBM + 8-octave Type FBM + up to 6-octave warp. Now a
+			// lookup into the baked cube (CloudCoverageMap.usf), indexed by direction from the planet center —
+			// exact, not an approximation, since WeatherMap never depended on radius (SamplePosition here is
+			// always at InnerRadius regardless of HeightGradient).
+			WeatherMap = TextureCubeSample(CoverageMapTexture, CoverageMapSampler, DirectionFromPlanetCenterAtStep).rg;
 
 			float Density = CloudIsoVolumeLowRes(SamplePosition, InnerRadius, WeatherMap, HeightFromBottom, HeightGradient);
 

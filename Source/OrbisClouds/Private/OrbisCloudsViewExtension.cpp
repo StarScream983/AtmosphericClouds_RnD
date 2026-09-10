@@ -52,6 +52,110 @@ void FOrbisCloudsViewExtension::BeginRenderViewFamily(FSceneViewFamily &InViewFa
 	}
 }
 
+bool FOrbisCloudsViewExtension::CoverageMapParamsMatch(const FOrbisCloudsPlanetRenderData& A, const FOrbisCloudsPlanetRenderData& B)
+{
+	// Only fields CloudCoverageMap.usf's bake actually reads — OuterRadius feeds PlanetDiameter there, so it
+	// belongs here despite also being a general planet property.
+	return A.CoverageMapResolution == B.CoverageMapResolution
+		&& A.CloudOuterRadius == B.CloudOuterRadius
+		&& A.CloudCoverageNoiseScale == B.CloudCoverageNoiseScale
+		&& A.BaseNoiseType == B.BaseNoiseType
+		&& A.NoiseSeed == B.NoiseSeed
+		&& A.NoiseOutputMin == B.NoiseOutputMin
+		&& A.NoiseOutputMax == B.NoiseOutputMax
+		&& A.CloudsCoverageOctaves == B.CloudsCoverageOctaves
+		&& A.CloudsCoverageLacunarity == B.CloudsCoverageLacunarity
+		&& A.CloudsCoverageGain == B.CloudsCoverageGain
+		&& A.bCloudsCoverageUseWarp == B.bCloudsCoverageUseWarp
+		&& A.CloudsCoverageWarpStrength == B.CloudsCoverageWarpStrength
+		&& A.CloudsCoverageWarpOctaves == B.CloudsCoverageWarpOctaves
+		&& A.CloudTypeNoiseScale == B.CloudTypeNoiseScale
+		&& A.CloudTypeNoiseSeed == B.CloudTypeNoiseSeed
+		&& A.CloudTypeNoiseType == B.CloudTypeNoiseType
+		&& A.CloudsTypeOctaves == B.CloudsTypeOctaves
+		&& A.CloudsTypeLacunarity == B.CloudsTypeLacunarity
+		&& A.CloudsTypeGain == B.CloudsTypeGain;
+}
+
+void FOrbisCloudsViewExtension::UpdateCoverageMap(FRDGBuilder& GraphBuilder, const FOrbisCloudsPlanetRenderData& PlanetForPass, ERHIFeatureLevel::Type FeatureLevel)
+{
+	const bool bNeedsBake = !bHasBakedCoverageMap || !CoverageMapRHI.IsValid() || !CoverageMapParamsMatch(PlanetForPass, LastBakedCoverageMapParams);
+	if (!bNeedsBake)
+	{
+		return;
+	}
+
+	// Always (re)create fresh rather than trying to detect "just needs a rewrite vs. needs resizing" —
+	// RHICreateTexture isn't expensive enough here to justify that extra complexity, and this only runs
+	// when parameters actually changed, not every frame.
+	const FRHITextureCreateDesc Desc = FRHITextureCreateDesc::CreateCube(TEXT("OrbisClouds.CoverageMap"), PlanetForPass.CoverageMapResolution, PF_G16R16F)
+											.SetFlags(ETextureCreateFlags::ShaderResource | ETextureCreateFlags::UAV);
+	CoverageMapRHI = RHICreateTexture(Desc);
+
+	FRDGTextureRef CoverageMapTexture = RegisterExternalTexture(GraphBuilder, CoverageMapRHI, TEXT("OrbisClouds.CoverageMap"));
+
+	FCloudCoverageMapCS::FParameters* ComputeParams = GraphBuilder.AllocParameters<FCloudCoverageMapCS::FParameters>();
+	ComputeParams->Resolution = PlanetForPass.CoverageMapResolution;
+	ComputeParams->OuterRadius = PlanetForPass.CloudOuterRadius;
+	ComputeParams->CloudCoverageNoiseScale = PlanetForPass.CloudCoverageNoiseScale;
+	ComputeParams->BaseNoiseType = PlanetForPass.BaseNoiseType;
+	ComputeParams->NoiseSeed = PlanetForPass.NoiseSeed;
+	ComputeParams->NoiseOutputMin = PlanetForPass.NoiseOutputMin;
+	ComputeParams->NoiseOutputMax = PlanetForPass.NoiseOutputMax;
+	ComputeParams->CloudsCoverageOctaves = PlanetForPass.CloudsCoverageOctaves;
+	ComputeParams->CloudsCoverageLacunarity = PlanetForPass.CloudsCoverageLacunarity;
+	ComputeParams->CloudsCoverageGain = PlanetForPass.CloudsCoverageGain;
+	ComputeParams->bCloudsCoverageUseWarp = PlanetForPass.bCloudsCoverageUseWarp ? 1u : 0u;
+	ComputeParams->CloudsCoverageWarpStrength = PlanetForPass.CloudsCoverageWarpStrength;
+	ComputeParams->CloudsCoverageWarpOctaves = PlanetForPass.CloudsCoverageWarpOctaves;
+	ComputeParams->CloudTypeNoiseScale = PlanetForPass.CloudTypeNoiseScale;
+	ComputeParams->CloudTypeNoiseSeed = PlanetForPass.CloudTypeNoiseSeed;
+	ComputeParams->CloudTypeNoiseType = PlanetForPass.CloudTypeNoiseType;
+	ComputeParams->CloudsTypeOctaves = PlanetForPass.CloudsTypeOctaves;
+	ComputeParams->CloudsTypeLacunarity = PlanetForPass.CloudsTypeLacunarity;
+	ComputeParams->CloudsTypeGain = PlanetForPass.CloudsTypeGain;
+	ComputeParams->OutCoverageMap = GraphBuilder.CreateUAV(CoverageMapTexture);
+
+	TShaderMapRef<FCloudCoverageMapCS> ComputeShader(GetGlobalShaderMap(FeatureLevel));
+	const uint32 GroupCount = FMath::DivideAndRoundUp(PlanetForPass.CoverageMapResolution, FCloudCoverageMapCS::ThreadGroupSize);
+	FComputeShaderUtils::AddPass(
+		GraphBuilder,
+		RDG_EVENT_NAME("OrbisClouds.CoverageMapBake"),
+		ComputeShader,
+		ComputeParams,
+		FIntVector(GroupCount, GroupCount, 6));
+
+	LastBakedCoverageMapParams = PlanetForPass;
+	bHasBakedCoverageMap = true;
+}
+
+bool FOrbisCloudsViewExtension::ResolvePlanetForPass(FOrbisCloudsPlanetRenderData& OutPlanet) const
+{
+	OutPlanet = CachedPlanet;
+	bool bShouldDraw = bHasCachedPlanet;
+
+	if (!bShouldDraw && CVarOrbisCloudsDebugSolid.GetValueOnRenderThread() != 0)
+	{
+		OutPlanet.PlanetCenter = FVector::ZeroVector;
+		OutPlanet.CloudInnerRadius = 590000000.f;
+		OutPlanet.CloudOuterRadius = 600000000.f;
+		bShouldDraw = true;
+	}
+
+	return bShouldDraw;
+}
+
+void FOrbisCloudsViewExtension::PreRenderViewFamily_RenderThread(FRDGBuilder& GraphBuilder, FSceneViewFamily& InViewFamily)
+{
+	FOrbisCloudsPlanetRenderData PlanetForPass;
+	if (!ResolvePlanetForPass(PlanetForPass))
+	{
+		return;
+	}
+
+	UpdateCoverageMap(GraphBuilder, PlanetForPass, InViewFamily.GetFeatureLevel());
+}
+
 void FOrbisCloudsViewExtension::PrePostProcessPass_RenderThread(
 	FRDGBuilder &GraphBuilder,
 	const FSceneView &View,
@@ -60,18 +164,8 @@ void FOrbisCloudsViewExtension::PrePostProcessPass_RenderThread(
 	const bool bDebugSolid = CVarOrbisCloudsDebugSolid.GetValueOnRenderThread() != 0;
 	const bool bDepthOcclusion = CVarOrbisCloudsDepthOcclusion.GetValueOnRenderThread() != 0;
 
-	FOrbisCloudsPlanetRenderData PlanetForPass = CachedPlanet;
-	bool bShouldDraw = bHasCachedPlanet;
-
-	if (!bShouldDraw && bDebugSolid)
-	{
-		PlanetForPass.PlanetCenter = FVector::ZeroVector;
-		PlanetForPass.CloudInnerRadius = 590000000.f;
-		PlanetForPass.CloudOuterRadius = 600000000.f;
-		bShouldDraw = true;
-	}
-
-	if (!bShouldDraw || !View.Family)
+	FOrbisCloudsPlanetRenderData PlanetForPass;
+	if (!ResolvePlanetForPass(PlanetForPass) || !View.Family)
 	{
 		return;
 	}
@@ -156,6 +250,12 @@ void FOrbisCloudsViewExtension::PrePostProcessPass_RenderThread(
 											 ? RegisterExternalTexture(GraphBuilder, PlanetForPass.DetailNoiseTextureRHI, TEXT("OrbisClouds.DetailNoise"))
 											 : GSystemTextures.GetVolumetricBlackDummy(GraphBuilder);
 	PassParameters->DetailNoiseSampler = TStaticSamplerState<SF_Bilinear, AM_Wrap, AM_Wrap, AM_Wrap>::GetRHI();
+
+	// CoverageMapRHI is a plain RHI resource that outlives this GraphBuilder, so it needs re-registering into
+	// this frame's graph even on frames UpdateCoverageMap didn't rebake it (RDG resources don't persist across
+	// FRDGBuilder instances the way the RHI resource itself does).
+	PassParameters->CoverageMapTexture = RegisterExternalTexture(GraphBuilder, CoverageMapRHI, TEXT("OrbisClouds.CoverageMap"));
+	PassParameters->CoverageMapSampler = TStaticSamplerState<SF_Bilinear, AM_Clamp, AM_Clamp, AM_Clamp>::GetRHI();
 
 	PassParameters->View = View.ViewUniformBuffer;
 	PassParameters->RenderTargets[0] = Output.GetRenderTargetBinding();

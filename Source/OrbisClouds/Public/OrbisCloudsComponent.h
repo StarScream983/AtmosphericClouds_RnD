@@ -14,6 +14,19 @@ enum class EOrbisCloudsBaseNoise : uint8
 	Value UMETA(DisplayName = "Value"),
 };
 
+// Per-face resolution for the baked Coverage/Type cube texture (CloudCoverageMap.usf). Values, not a free
+// int, so the ImGui/editor selector can only ever request something the compute shader was actually sized
+// to test against — see Docs/NOTES.md for the Nyquist reasoning behind picking a resolution.
+UENUM(BlueprintType)
+enum class ECoverageMapResolution : uint8
+{
+	Res512 UMETA(DisplayName = "512"),
+	Res1024 UMETA(DisplayName = "1024"),
+	Res2048 UMETA(DisplayName = "2048"),
+	Res4096 UMETA(DisplayName = "4096"),
+	Res8192 UMETA(DisplayName = "8192"),
+};
+
 UCLASS(ClassGroup = (OrbisClouds), meta = (BlueprintSpawnableComponent, DisplayName = "Orbis Clouds Component"))
 class ORBISCLOUDS_API UOrbisCloudsComponent : public USceneComponent
 {
@@ -98,6 +111,13 @@ public:
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "OrbisClouds|Authored Textures", meta = (ClampMin = "1.0"))
 	float BaseShapeWorldSpan = 17000000.f;
 
+	// Per-face resolution of the baked Coverage/Type cube texture (CloudCoverageMap.usf) — replaces the
+	// live per-raymarch-sample CalculateWeatherMap call that made close-up views unusably slow. Exposed for
+	// live A/B testing against the actual noise settings' Nyquist requirement (Docs/NOTES.md), not a fixed
+	// "final" value yet.
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "OrbisClouds|Cloud Coverage")
+	ECoverageMapResolution CoverageMapResolution = ECoverageMapResolution::Res2048;
+
 	FOrbisCloudsPlanetRenderData BuildPlanetRenderData() const;
 	void NotifyChanged();
 
@@ -113,7 +133,7 @@ protected:
 	virtual void BeginPlay() override;
 
 #if WITH_EDITOR
-	virtual void PostEditChangeProperty(FPropertyChangedEvent& PropertyChangedEvent) override;
+	virtual void PostEditChangeProperty(FPropertyChangedEvent &PropertyChangedEvent) override;
 #endif
 
 private:

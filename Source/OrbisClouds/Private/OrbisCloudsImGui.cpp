@@ -154,13 +154,18 @@ void OrbisCloudsImGui::Draw(UOrbisCloudsComponent *Component)
 	}
 
 	ImGui::Separator();
-	ImGui::TextUnformatted("Authored Textures");
+	ImGui::TextUnformatted("Coverage Map");
 
-	const bool bBaseShapeAssigned = Component->BaseShapeNoiseTexture != nullptr;
-	const bool bBaseShapeHasResource = bBaseShapeAssigned && Component->BaseShapeNoiseTexture->GetResource() != nullptr;
-	ImGui::Text(
-		"Base Shape Noise Texture: %s",
-		!bBaseShapeAssigned ? "NOT ASSIGNED" : (bBaseShapeHasResource ? "assigned, resource OK" : "assigned, NO RESOURCE (not loaded?)"));
+	int32 CoverageMapResolutionIndex = static_cast<int32>(Component->CoverageMapResolution);
+	const char *CoverageMapResolutionNames[] = {"512", "1024", "2048", "4096", "8192"};
+	if (ImGui::Combo("Resolution##CoverageMap", &CoverageMapResolutionIndex, CoverageMapResolutionNames, UE_ARRAY_COUNT(CoverageMapResolutionNames)))
+	{
+		Component->CoverageMapResolution = static_cast<ECoverageMapResolution>(CoverageMapResolutionIndex);
+		Component->NotifyChanged();
+	}
+
+	ImGui::Separator();
+	ImGui::TextUnformatted("Authored Textures");
 
 	if (ImGui::DragFloat("Base Shape World Span", &Component->BaseShapeWorldSpan, 10.f, 1.f, 1000000.f, "%.1f"))
 	{

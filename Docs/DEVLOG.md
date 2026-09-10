@@ -193,3 +193,13 @@ Color = ... // Color is currently a scalar broadcast to OutColor.rgb — this ne
 That last part means restructuring the end of `MainPS` slightly since `Color`/`OutColor = float4(Color,Color,Color,1)` is shared across all view modes — cases 0/1 stay scalar, case 2 needs its own `OutColor` write with the colored `Radiance` and `(1.0 - Transmittance)` alpha.
 
 Not yet applied — `Noise.ush`'s Coverage/CloudType formula is currently mid-flux (uncommitted `clamp` vs `lerp` swap), sort that out first.
+
+---
+
+96 steps are not enough for planet scale, Scrappy told me he's using 512 steps, which gives us plenty of head room, i tried 512 but the performance goes down dramatically because density sampling computes the weather map many times, so i decided to start optimizing by caching the weather map with a compute shader:
+
+### GOALS:
+
+- in IMGUI, make options select for RT cube map: 512, 1024, 2048, 4096 (maybe 8k)
+- write the compute shader that computes the coverage/type map
+- store it in buffer and bind it to the CustomViewSceneComponent

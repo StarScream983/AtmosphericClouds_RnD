@@ -41,6 +41,9 @@ struct FOrbisCloudsPlanetRenderData
 	float CloudsTypeLacunarity = 2.f;
 	float CloudsTypeGain = 0.5f;
 	float BaseShapeWorldSpan = 17000000.f;
+	// Resolved pixel value, not the UENUM — render-thread side doesn't need to know about
+	// ECoverageMapResolution at all, matching how the other plain values here work.
+	uint32 CoverageMapResolution = 2048u;
 
 	// RHI refs, not raw UTexture pointers — safe to read on the render thread. Extracted from
 	// UOrbisCloudsComponent's BaseShapeNoiseTexture/DetailNoiseTexture on the game thread in

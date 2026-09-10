@@ -36,6 +36,24 @@ FOrbisCloudsPlanetRenderData UOrbisCloudsComponent::BuildPlanetRenderData() cons
 	Data.CloudsTypeLacunarity = FMath::Clamp(CloudsTypeLacunarity, 1.f, 4.f);
 	Data.CloudsTypeGain = FMath::Clamp(CloudsTypeGain, 0.1f, 0.9f);
 	Data.BaseShapeWorldSpan = FMath::Max(BaseShapeWorldSpan, 1.f);
+	switch (CoverageMapResolution)
+	{
+	case ECoverageMapResolution::Res512:
+		Data.CoverageMapResolution = 512u;
+		break;
+	case ECoverageMapResolution::Res1024:
+		Data.CoverageMapResolution = 1024u;
+		break;
+	case ECoverageMapResolution::Res2048:
+		Data.CoverageMapResolution = 2048u;
+		break;
+	case ECoverageMapResolution::Res4096:
+		Data.CoverageMapResolution = 4096u;
+		break;
+	case ECoverageMapResolution::Res8192:
+		Data.CoverageMapResolution = 8192u;
+		break;
+	}
 	if (BaseShapeNoiseTexture && BaseShapeNoiseTexture->GetResource())
 	{
 		Data.BaseShapeNoiseTextureRHI = BaseShapeNoiseTexture->GetResource()->TextureRHI;
