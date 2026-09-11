@@ -73,8 +73,7 @@ float3 GetCubeDirection(uint Face, float2 FaceUV)
 	}
 }
 
-[numthreads(THREADGROUP_SIZE, THREADGROUP_SIZE, 1)]
-void MainCS(uint3 DispatchThreadId : SV_DispatchThreadID)
+[numthreads(THREADGROUP_SIZE, THREADGROUP_SIZE, 1)] void MainCS(uint3 DispatchThreadId : SV_DispatchThreadID)
 {
 	if (DispatchThreadId.x >= Resolution || DispatchThreadId.y >= Resolution)
 	{

@@ -218,8 +218,8 @@ void ClipShellBySceneDepth(inout float tRaymarchEnter, inout float tRaymarchExit
 
 // RAYMARCHING OPTICAL DEPTH, DENSITY AND CLOUD SHAPES----------------------------------------------
 
-#define ZENITH_MARCH_MIN_STEPS 54  // 64
-#define HORIZON_MARCH_MAX_STEPS 96 // 128
+#define ZENITH_MARCH_MIN_STEPS 288	// 64
+#define HORIZON_MARCH_MAX_STEPS 512 // 128
 
 // Thin bottom/top fade bands into a flat 1.0 plateau (HZD slide silhouettes).
 float ThinEdgeFade(float h, float BottomEdge, float TopEdge)
