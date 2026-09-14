@@ -203,3 +203,17 @@ Not yet applied — `Noise.ush`'s Coverage/CloudType formula is currently mid-fl
 - in IMGUI, make options select for RT cube map: 512, 1024, 2048, 4096 (maybe 8k)
 - write the compute shader that computes the coverage/type map
 - store it in buffer and bind it to the CustomViewSceneComponent
+
+---
+
+## WHY OURS FAILED VS HORIZON'S
+
+Three real differences, one root cause.
+
+**Density sampling.** Ours used Marshmallow's structure — coverage applied as a _final multiplier_ after two independent thresholds (`Remap(BaseShapeNoise.x * HeightSignal, 0.3, ...)`, then erosion), split across low-res/hi-res functions. Horizon's uses the reference formula where coverage sits _inside_ the remap chain (`1 - WeatherParam.x * WeatherState` as the threshold itself). In ours, coverage fought the noise threshold instead of shaping it — which is why we bounced that `0.3 → 0.05 → 0.15` constant around without ever landing.
+
+**Textures.** The real killer. Those constants (`0.3`, `ErosionStrength = 0.15`, etc.) were reverse-engineered against the _reference's own authored textures_. Our procedurally generated ones have different value distribution and contrast, so the same formula fed different input statistics produces garbage. That's why swapping in Horizon's textures made it click instantly. Compounding it: we sampled with implicit-derivative `Texture3DSample` (derivative blowup at planet scale → blurriest mip everywhere), and `BaseShapeWorldSpan` was 170km per puff vs the verified 2km — 85x off.
+
+**Stepping.** Ours derived `StepSize = SegmentLength / StepCount`, so step size scaled with ray length and grazing rays got enormous steps. Horizon's is a fixed physical step, decoupled from ray length. We also had no jitter, and sampled 3D noise at `Direction * InnerRadius` — a constant radius, so the noise never varied with height and the vertical silhouette was pure analytic falloff.
+
+**Why following HZD wasn't enough:** the talk describes the _architecture_ — weather map, Perlin-Worley base, Worley erosion, height gradient, Beer + HG + powder. It doesn't give you the calibrated constants, and it can't give you the authored textures those constants were tuned against. We had the right pipeline with every tuned number either guessed or paired with data it was never calibrated for. Correct architecture + uncalibrated constants + mismatched textures still fails.
