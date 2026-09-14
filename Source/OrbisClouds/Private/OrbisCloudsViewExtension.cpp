@@ -251,11 +251,11 @@ void FOrbisCloudsViewExtension::PrePostProcessPass_RenderThread(
 											 : GSystemTextures.GetVolumetricBlackDummy(GraphBuilder);
 	PassParameters->DetailNoiseSampler = TStaticSamplerState<SF_Bilinear, AM_Wrap, AM_Wrap, AM_Wrap>::GetRHI();
 
-	PassParameters->bHasCurlNoiseTexture = PlanetForPass.CurlNoiseTextureRHI.IsValid() ? 1u : 0u;
-	PassParameters->CurlNoiseTexture = PlanetForPass.CurlNoiseTextureRHI.IsValid()
-											? RegisterExternalTexture(GraphBuilder, PlanetForPass.CurlNoiseTextureRHI, TEXT("OrbisClouds.CurlNoise"))
+	PassParameters->bHasTiledCoverageMap = PlanetForPass.TiledCoverageMapRHI.IsValid() ? 1u : 0u;
+	PassParameters->TiledCoverageMap = PlanetForPass.TiledCoverageMapRHI.IsValid()
+											? RegisterExternalTexture(GraphBuilder, PlanetForPass.TiledCoverageMapRHI, TEXT("OrbisClouds.TiledCoverageMap"))
 											: GSystemTextures.GetBlackDummy(GraphBuilder);
-	PassParameters->CurlNoiseSampler = TStaticSamplerState<SF_Bilinear, AM_Wrap, AM_Wrap, AM_Wrap>::GetRHI();
+	PassParameters->TiledCoverageMapSampler = TStaticSamplerState<SF_Bilinear, AM_Wrap, AM_Wrap, AM_Wrap>::GetRHI();
 
 	// CoverageMapRHI is a plain RHI resource that outlives this GraphBuilder, so it needs re-registering into
 	// this frame's graph even on frames UpdateCoverageMap didn't rebake it (RDG resources don't persist across
@@ -267,7 +267,11 @@ void FOrbisCloudsViewExtension::PrePostProcessPass_RenderThread(
 	PassParameters->RenderTargets[0] = Output.GetRenderTargetBinding();
 
 	TShaderMapRef<FScreenPassVS> VertexShader(GlobalShaderMap);
-	FRHIBlendState *AlphaBlendState = FScreenPassPipelineState::FDefaultBlendState::GetRHI();
+	// Was: FDefaultBlendState — TStaticBlendState<> defaults to BF_One/BF_Zero, a fully opaque overwrite that
+	// ignores the shader's alpha entirely, so OutColor's (1 - Transmittance) did nothing and empty sky got
+	// painted with the shader's own graded ShadowColor/AtmosphereFogColor instead of showing the real scene.
+	// Same bug (and same fix) as HorizonClouds' own blend state.
+	FRHIBlendState *AlphaBlendState = TStaticBlendState<CW_RGBA, BO_Add, BF_SourceAlpha, BF_InverseSourceAlpha, BO_Add, BF_Zero, BF_One>::GetRHI();
 	FRHIDepthStencilState *DepthStencilState = FScreenPassPipelineState::FDefaultDepthStencilState::GetRHI();
 
 	AddDrawScreenPass(

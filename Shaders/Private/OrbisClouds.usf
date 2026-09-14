@@ -43,9 +43,9 @@ Texture3D DetailNoiseTexture;
 SamplerState DetailNoiseSampler;
 uint bHasBaseShapeNoiseTexture;
 uint bHasDetailNoiseTexture;
-Texture2D CurlNoiseTexture;
-SamplerState CurlNoiseSampler;
-uint bHasCurlNoiseTexture;
+Texture2D TiledCoverageMap;
+SamplerState TiledCoverageMapSampler;
+uint bHasTiledCoverageMap;
 
 // Baked Coverage(r)/Type(g) cube (CloudCoverageMap.usf) — replaces the live CalculateWeatherMap FBM+warp
 // call at every raymarch sample. WeatherMap only ever depends on direction from the planet center (not on
@@ -54,7 +54,7 @@ uint bHasCurlNoiseTexture;
 TextureCube CloudGlobalCoverageMap;
 SamplerState CloudGlobalCoverageMapSampler;
 
-// Projects a flat 2D coverage texture (reusing the CurlNoiseTexture slot — assign the HorizonClouds
+// Projects a flat 2D coverage texture (reusing the TiledCoverageMap slot — assign the HorizonClouds
 // WeatherTexture asset into it) onto the sphere via a naive dominant-axis (cube-face-like) projection at a
 // fixed 40km world tile. Returns the full RGBA, matching HorizonClouds' WeatherTexture layout exactly (r/g
 // weather state, b height-ceiling, a density/precipitation gate) — SampleDensity below reads all 4 channels
@@ -62,10 +62,10 @@ SamplerState CloudGlobalCoverageMapSampler;
 // CloudGlobalCoverageMap — used both by the case 6u visualization and by the actual raymarch.
 float4 SampleTiledCoverage(float3 Direction, float3 Position)
 {
-	// Global coverage blending disabled for now — verifying the ported HorizonClouds basic setup
-	// (density/stepping/lighting) in isolation first, matching HorizonClouds' own single-source coverage
-	// (just the tiled texture, no second blended source). Re-enable once the basic port is confirmed working.
-	// const float CubeCoverageWeight = TextureCubeSample(CloudGlobalCoverageMap, CloudGlobalCoverageMapSampler, Direction).r;
+	// Global coverage blending disabled again — tiled texture only, matching HorizonClouds' single-source
+	// coverage. To re-enable: restore this sample (the saturate() matters — the raw bake goes negative, and
+	// a negative weight makes the sqrt() in the return NaN) and blend it back in below.
+	// const float CubeCoverageWeight = saturate(TextureCubeSample(CloudGlobalCoverageMap, CloudGlobalCoverageMapSampler, Direction).r);
 
 	const float3 AbsDir = abs(Direction);
 	float2 ProjectedUV;
@@ -83,9 +83,10 @@ float4 SampleTiledCoverage(float3 Direction, float3 Position)
 	}
 
 	const float TilingCoverageTileSize = 4000000.0; // 40km, matches HorizonClouds' verified WeatherTexTile
-	const float4 TilingSample = (bHasCurlNoiseTexture != 0u)
-									? Texture2DSampleLevel(CurlNoiseTexture, CurlNoiseSampler, ProjectedUV / TilingCoverageTileSize, 0)
+	const float4 TilingSample = (bHasTiledCoverageMap != 0u)
+									? Texture2DSampleLevel(TiledCoverageMap, TiledCoverageMapSampler, ProjectedUV / TilingCoverageTileSize, 0)
 									: float4(0., 0., 0., 1.);
+	// To re-enable global coverage: return sqrt(saturate(TilingSample) * CubeCoverageWeight);
 	return saturate(TilingSample);
 }
 
@@ -116,7 +117,10 @@ float SampleDensity(float3 Position, float3 Direction, float HeightGradient, flo
 								  ? Texture3DSampleLevel(DetailNoiseTexture, DetailNoiseSampler, Position / SmallNoiseTexTile, LOD)
 								  : float4(0.0, 0.0, 0.0, 0.0);
 
-	float4 WeatherMap = SampleTiledCoverage(Direction, Position);
+	// Coverage is intentionally height-independent (WeatherMap only ever depends on direction from the
+	// planet center, verified in HorizonClouds too) — sampled at a fixed InnerRadius reference regardless of
+	// Position's actual (real, varying) radius, unlike the 3D noise above which needs the true height.
+	float4 WeatherMap = SampleTiledCoverage(Direction, Direction * InnerRadius);
 
 	const float2 WeatherParam = float2(0.65, 14.0);
 
@@ -242,7 +246,7 @@ void MainPS(
 	}
 	case 6u:
 	{
-		// TILING COVERAGE TEST: projects a flat 2D coverage texture (reusing the CurlNoiseTexture slot —
+		// TILING COVERAGE TEST: projects a flat 2D coverage texture (reusing the TiledCoverageMap slot —
 		// assign the HorizonClouds WeatherTexture asset into it) onto the sphere at a fixed 80km world tile,
 		// using a naive dominant-axis (cube-face-like) projection. Isolates whether this specific texture
 		// shows visible tile repetition / cube-projection distortion at this scale, independent of the
@@ -289,7 +293,9 @@ void MainPS(
 
 		const float AtmosphereBlendDistance = 1000000000.0;
 		const float AtmosphereBlendIntensity = 1.0;
-		const float3 AtmosphereFogColor = float3(0.5, 0.6, 0.7);
+		// Was: (0.5, 0.6, 0.7) — a 0.2 spread between R and B read as a distinctly blue wash rather than haze.
+		// Brighter and much less saturated (0.08 spread): still atmosphere-tinted, but soft instead of blue.
+		const float3 AtmosphereFogColor = float3(0.70, 0.73, 0.78);
 
 		// Reused from HorizonClouds' verified material-instance value — not yet independently verified for
 		// OrbisClouds' own scene, since there's no real scene directional light wired here yet.
@@ -340,7 +346,10 @@ void MainPS(
 			if (HeightGradient >= 0.0 && HeightGradient <= 1.0)
 			{
 				DirectionFromPlanetCenterAtStep = ComputePreciseDirectionFromPlanetCenter(RayDirection, t, PlanetCenterRelativeDF);
-				SamplePosition = DirectionFromPlanetCenterAtStep * InnerRadius;
+				// Real, height-varying position — was DirectionFromPlanetCenterAtStep*InnerRadius (a constant
+				// radius regardless of actual height), which collapsed the 3D noise to the same value across
+				// the whole shell thickness and produced the smeared/stretched cloud-bottom artifact.
+				SamplePosition = DirectionFromPlanetCenterAtStep * Radius;
 				DensitySample = SampleDensity(SamplePosition, DirectionFromPlanetCenterAtStep, HeightGradient, MipMapDistanceScale);
 			}
 
@@ -357,7 +366,7 @@ void MainPS(
 					{
 						MipMapDistanceScale = min(floor(t / MipMapScaleDistance), 5.0);
 						DirectionFromPlanetCenterAtStep = ComputePreciseDirectionFromPlanetCenter(RayDirection, t, PlanetCenterRelativeDF);
-						SamplePosition = DirectionFromPlanetCenterAtStep * InnerRadius;
+						SamplePosition = DirectionFromPlanetCenterAtStep * RadiusBack;
 						DensitySample = SampleDensity(SamplePosition, DirectionFromPlanetCenterAtStep, HeightGradientBack, MipMapDistanceScale);
 					}
 				}

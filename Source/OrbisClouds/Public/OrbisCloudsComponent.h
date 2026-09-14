@@ -118,7 +118,7 @@ public:
 	TObjectPtr<UVolumeTexture> DetailNoiseTexture = nullptr;
 
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "OrbisClouds|Authored Textures")
-	TObjectPtr<UTexture2D> CurlNoiseTexture = nullptr;
+	TObjectPtr<UTexture2D> TiledCoverageMap = nullptr;
 
 	// UU that one full tile of BaseShapeNoiseTexture covers — controls how large a single cloud puff reads as
 	// in world space. Exposed for live testing; was a hardcoded shader constant.

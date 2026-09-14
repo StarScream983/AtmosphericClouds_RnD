@@ -62,9 +62,9 @@ FOrbisCloudsPlanetRenderData UOrbisCloudsComponent::BuildPlanetRenderData() cons
 	{
 		Data.DetailNoiseTextureRHI = DetailNoiseTexture->GetResource()->TextureRHI;
 	}
-	if (CurlNoiseTexture && CurlNoiseTexture->GetResource())
+	if (TiledCoverageMap && TiledCoverageMap->GetResource())
 	{
-		Data.CurlNoiseTextureRHI = CurlNoiseTexture->GetResource()->TextureRHI;
+		Data.TiledCoverageMapRHI = TiledCoverageMap->GetResource()->TextureRHI;
 	}
 	return Data;
 }
