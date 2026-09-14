@@ -54,19 +54,18 @@ uint bHasCurlNoiseTexture;
 TextureCube CloudGlobalCoverageMap;
 SamplerState CloudGlobalCoverageMapSampler;
 
-// Tiling coverage test: projects a flat 2D coverage texture (reusing the CurlNoiseTexture slot — assign the
-// HorizonClouds WeatherTexture asset into it) onto the sphere via a naive dominant-axis (cube-face-like)
-// projection at a fixed 80km world tile. Returns (Coverage, Type) matching WeatherMap's layout, so it's a
-// drop-in alternative source to CloudGlobalCoverageMap — used both by the case 6u visualization and, when
-// selected, by the actual raymarch's WeatherMap sampling.
-float2 SampleTiledCoverage(float3 Direction, float3 Position)
+// Projects a flat 2D coverage texture (reusing the CurlNoiseTexture slot — assign the HorizonClouds
+// WeatherTexture asset into it) onto the sphere via a naive dominant-axis (cube-face-like) projection at a
+// fixed 40km world tile. Returns the full RGBA, matching HorizonClouds' WeatherTexture layout exactly (r/g
+// weather state, b height-ceiling, a density/precipitation gate) — SampleDensity below reads all 4 channels
+// the same way HorizonClouds' verified SampleDensity does. Drop-in alternative source to
+// CloudGlobalCoverageMap — used both by the case 6u visualization and by the actual raymarch.
+float4 SampleTiledCoverage(float3 Direction, float3 Position)
 {
-	// Weight, not gate: the baked cube map's raw (unsaturated) Coverage channel is the "how much weather
-	// system here" signal from the already-tuned procedural generation — it can genuinely go negative
-	// (NoiseOutputMin is user-exposed and defaults below 0). A hard >=0 cutoff produced a harsh binary
-	// mask (blobby continents + salt-and-pepper speckle); multiplying by a saturated weight instead blends
-	// smoothly, tapering the tiled texture's contribution down near zero instead of snapping it off.
-	const float CubeCoverageWeight = TextureCubeSample(CloudGlobalCoverageMap, CloudGlobalCoverageMapSampler, Direction).r;
+	// Global coverage blending disabled for now — verifying the ported HorizonClouds basic setup
+	// (density/stepping/lighting) in isolation first, matching HorizonClouds' own single-source coverage
+	// (just the tiled texture, no second blended source). Re-enable once the basic port is confirmed working.
+	// const float CubeCoverageWeight = TextureCubeSample(CloudGlobalCoverageMap, CloudGlobalCoverageMapSampler, Direction).r;
 
 	const float3 AbsDir = abs(Direction);
 	float2 ProjectedUV;
@@ -83,18 +82,11 @@ float2 SampleTiledCoverage(float3 Direction, float3 Position)
 		ProjectedUV = Position.xy;
 	}
 
-	const float TilingCoverageTileSize = 4000000.0; // 80km
+	const float TilingCoverageTileSize = 4000000.0; // 40km, matches HorizonClouds' verified WeatherTexTile
 	const float4 TilingSample = (bHasCurlNoiseTexture != 0u)
 									? Texture2DSampleLevel(CurlNoiseTexture, CurlNoiseSampler, ProjectedUV / TilingCoverageTileSize, 0)
 									: float4(0., 0., 0., 1.);
-	// Geometric mean (not a threshold-remap, not a flat multiply): sqrt(a*b) combines two [0,1] signals
-	// without the "0.7*0.7=0.49" double-attenuation a flat multiply causes, and without the near-binary
-	// steep threshold the division-based remap produced when CubeCoverageWeight was small (which is most
-	// of a planet, since coverage is sparse) — that steepness was amplifying the tiled texture's own
-	// high-frequency noise into the grainy/dithered "static" pattern seen on screen. This is smooth and
-	// division-free everywhere, no epsilon guard needed.
-	return sqrt(saturate(TilingSample.rg) * CubeCoverageWeight);
-	// return TilingSample.rg;
+	return saturate(TilingSample);
 }
 
 // Standard remap: rescales Value from the [OldMin, OldMax] range to [NewMin, NewMax], clamped.
@@ -103,112 +95,43 @@ float Remap(float Value, float OldMin, float OldMax, float NewMin, float NewMax)
 	return NewMin + saturate((Value - OldMin) / (OldMax - OldMin)) * (NewMax - NewMin);
 }
 
-// Beer's law: how much light survives passing through a given optical depth.
-float BeersLaw(float OpticalDepth)
-{
-	return exp(-OpticalDepth);
-}
-
-// Henyey-Greenstein phase function: probability of light scattering toward the viewer at a given angle.
-// G > 0 favors forward scattering (the "silver lining" toward the sun), G < 0 favors backward scattering.
-float HenyeyGreenstein(float CosAngle, float G)
-{
-	const float G2 = G * G;
-	return (1.0 - G2) / (4.0 * 3.1415927 * pow(1.0 + G2 - 2.0 * G * CosAngle, 1.5));
-}
-
-// Schneider's "powdered sugar" term (HZD 2015 talk, slides 58-64): darkens the edges facing the light,
-// approximating the extra in-scattered light gathered deeper inside a cloud. Saturates faster than plain
-// Beer's law (2x the exponent), so it punches through on thin/shallow edges instead of staying dark there.
-float Powder(float OpticalDepth)
-{
-	return 1.0 - exp(-OpticalDepth * 2.0);
-}
-
-// cloudTest equivalent (Project-Marshmallow compute-clouds.comp:231-253, verified verbatim against source
-// before implementing — see comment on Remap's caller below for the exact original). densityNoise there is
-// our BaseShapeNoiseTexture (4-channel: R = base shape, GBA = Worley erosion octaves at increasing
-// frequency). Coverage is NOT a flat multiplier on the final density — it's the threshold used inside a
-// second remap on the erosion/fbm channels, which is what actually carves the shape.
-// Defined here (not in OrbisClouds.ush) so it can reference BaseShapeNoiseTexture/BaseShapeNoiseSampler
-// directly as globals — OrbisClouds.ush is #included above the texture global declarations, so a function
-// living there can't see them without passing them in as parameters every call.
-float CloudIsoVolumeLowRes(
-	float3 SamplePosition,
-	float InnerRadius,
-	float2 WeatherMap,
-	float HeightFromBottom,
-	float HeightGradient)
+// Ported verbatim from HorizonClouds' verified SampleDensity (HorizonClouds.usf), which is itself traced
+// directly from the purchased VolumetricClouds plugin's M_VolumetricClouds.uasset material graph. Same
+// formula, same tile scales (BaseNoiseTexTile=200,000 / SmallNoiseTexTile=17,391 — HorizonClouds'
+// DEVLOG.md line 13), same WeatherMap channel layout — just reading BaseShapeNoiseTexture/DetailNoiseTexture
+// (OrbisClouds' names for the same HorizonClouds-authored textures) and using SampleTiledCoverage in place
+// of a plain 2D Position.xy sample, since Position here is relative to a sphere, not a flat box.
+float SampleDensity(float3 Position, float3 Direction, float HeightGradient, float LOD)
 {
 	if (bHasBaseShapeNoiseTexture == 0u)
 	{
-		// No authored base-shape texture assigned — fall back to the plain height profile so this doesn't
-		// just go silent.
 		return lerp(0.8, 0.1, HeightGradient);
 	}
 
-	// Was: CloudCoverageNoiseScale / PlanetDiameter — tied the 128^3 texture's sampling frequency to planet
-	// size, so at Small preset a raymarch step moved the sample position by a tiny fraction of one texel,
-	// stretching the texture's actual detail across the whole planet diameter and never resolving it. Fixed
-	// constant instead, independent of which preset is active — a cloud puff's physical size shouldn't
-	// change depending on the preset button. Same tens-of-thousands-of-UU ballpark Marshmallow (2.5% of a
-	// 2,000,000 UU planet = 50,000) and YVAN Volume 11 (fixed 600,000) actually use.
-	// Was: hardcoded 12000.0, then BaseShapeWorldSpan (ImGui-exposed, defaulted to 17,000,000 = 170km) — 85x
-	// too large compared to the verified reference scale below, which is exactly what produced the smooth,
-	// blurry, no-puff-detail look diagnosed earlier. 200,000 UU (2km) is HorizonClouds' own verified
-	// BaseNoiseTexTile (= BoxSizeX/NoiseTile = 4,000,000/20, traced directly from the reference material
-	// graph — see HorizonClouds/Resources/DEVLOG.md line 13), a real individual-cloud-puff physical size.
-	const float BaseShapeFrequency = 1.0 / 200000.0;
-	const float4 BaseShapeNoise = Texture3DSampleLevel(BaseShapeNoiseTexture, BaseShapeNoiseSampler, SamplePosition * BaseShapeFrequency, 0);
+	const float BaseNoiseTexTile = 200000.0;
+	const float SmallNoiseTexTile = 17391.0;
 
-	// calculate HeightSignal — verified from the purchased VolumetricClouds plugin's M_VolumetricClouds.uasset
-	// (Content/Materials), structurally the same technique as HZD's own height-gradient: two remaps
-	// multiplied together, using a continuous per-pixel height-ceiling scalar (their WeatherMap.b, our
-	// WeatherMap.y) instead of blending between discrete Stratus/Cumulus/Cumulonimbus preset functions.
-	// Was (verbatim):
-	//   float ShapeAltering = saturate(Remap(HeightGradient, 0, 0.07, 0, 1))
-	//                       * saturate(Remap(HeightGradient, WeatherMap.b * 0.2, WeatherMap.b, 1, 0));
-	const float CloudTypeHeight = WeatherMap.y;
-	const float HeightSignal = saturate(Remap(HeightGradient, 0.0, 0.07, 0.0, 1.0)) * saturate(Remap(HeightGradient, CloudTypeHeight * 0.2, CloudTypeHeight, 1.0, 0.0));
+	const float4 BaseNoise = Texture3DSampleLevel(BaseShapeNoiseTexture, BaseShapeNoiseSampler, Position / BaseNoiseTexTile, LOD);
+	const float4 SmallNoise = (bHasDetailNoiseTexture != 0u)
+								  ? Texture3DSampleLevel(DetailNoiseTexture, DetailNoiseSampler, Position / SmallNoiseTexTile, LOD)
+								  : float4(0.0, 0.0, 0.0, 0.0);
 
-	// Was: Remap(..., 0.3, 1.0, 0.0, 1.0) — too restrictive, fought the coverage map's own shape (see below).
-	// Then tried 0.05 — overcorrected the other way: let the base shape noise's own high-frequency grain
-	// through everywhere as fine uniform static/speckle, drowning out the coverage map's shape entirely
-	// instead of revealing it. 0.15 as a middle point between the two.
-	float Density = Remap(BaseShapeNoise.x * HeightSignal, 0.15, 1.0, 0.0, 1.0);
+	float4 WeatherMap = SampleTiledCoverage(Direction, Position);
 
-	const float Erosion = 0.625 * BaseShapeNoise.y + 0.25 * BaseShapeNoise.z + 0.125 * BaseShapeNoise.w;
-	const float ErosionStrength = 0.15;
-	const float ErosionThreshold = Erosion * ErosionStrength;
-	Density = Remap(Density, ErosionThreshold, 1.0, 0.0, 1.0);
+	const float2 WeatherParam = float2(0.65, 14.0);
 
-	const float Coverage = WeatherMap.x;
-	Density *= Coverage * (1. - HeightGradient);
+	WeatherMap.b = saturate(WeatherMap.b + ((WeatherParam.x - 0.5) * 2.0));
+	const float WeatherState = max(WeatherMap.r, saturate(WeatherParam.x - 0.5) * 2.0 * WeatherMap.g);
 
-	return Density;
-}
+	const float ShapeAltering = saturate(Remap(HeightGradient, 0.0, 0.07, 0.0, 1.0)) * saturate(Remap(HeightGradient, WeatherMap.b * 0.2, WeatherMap.b, 1.0, 0.0));
+	const float DensityAltering = WeatherParam.y * HeightGradient * saturate(Remap(HeightGradient, 0.0, 0.15, 0.0, 1.0)) * saturate(Remap(HeightGradient, 0.9, 1.0, 1.0, 0.0)) * WeatherMap.a * 2.0;
 
-float CloudHighRes(float3 SamplePosition, float OrigDensity, float HeightGradient, float Coverage)
-{
-	if (bHasDetailNoiseTexture == 0u)
-	{
-		return OrigDensity;
-	}
+	const float BaseNoiseSample = Remap(BaseNoise.r, (BaseNoise.g * 0.625 + BaseNoise.b * 0.25 + BaseNoise.a * 0.125) - 1.0, 1.0, 0.0, 1.0);
+	const float SmallNoiseSample = SmallNoise.r * 0.625 + SmallNoise.g * 0.25 + SmallNoise.b * 0.125;
+	const float DetailNoise = 0.35 * exp(-WeatherParam.x * 0.75) * lerp(SmallNoiseSample, 1.0 - SmallNoiseSample, saturate(HeightGradient * 10.0));
 
-	// Was: BaseShapeWorldSpan/8 — an arbitrary divisor, not verified against anything. HorizonClouds' actual
-	// verified ratio is SmallNoiseTile/NoiseTile = 230/20 = 11.5, not 8. 17,391 UU (~174m) is HorizonClouds'
-	// own verified SmallNoiseTexTile (= BoxSizeX/SmallNoiseTile = 4,000,000/230 — see
-	// HorizonClouds/Resources/DEVLOG.md line 13), paired with the 200,000 UU base scale above.
-	const float DetailShapeWorldSpan = 17391.0;
-	const float DetailFrequency = 1.0 / DetailShapeWorldSpan;
-
-	const float4 DetailNoise = Texture3DSampleLevel(DetailNoiseTexture, DetailNoiseSampler, SamplePosition * DetailFrequency, 0);
-
-	float Erosion = 0.625 * DetailNoise.x + 0.25 * DetailNoise.y + 0.125 * DetailNoise.z;
-	Erosion = lerp(Erosion, 1.0 - Erosion, saturate(HeightGradient * 10.0));
-
-	const float HiResErosionStrength = 0.15; // 0.35 * exp(-Coverage * 0.75);
-	return Remap(OrigDensity, Erosion * HiResErosionStrength, 1.0, 0.0, 1.0);
+	const float ShapeNoise = saturate(Remap(BaseNoiseSample * ShapeAltering, 1.0 - WeatherParam.x * WeatherState, 1.0, 0.0, 1.0));
+	return saturate(Remap(ShapeNoise, DetailNoise, 1.0, 0.0, 1.0)) * DensityAltering;
 }
 
 void MainPS(
@@ -302,7 +225,7 @@ void MainPS(
 		// TEMPORARY DEBUG: green = bHasBaseShapeNoiseTexture is 1 (texture actually seen by the shader), red
 		// = 0 (texture not seen, even though it's assigned in the editor) — isolating whether the fallback
 		// density path is running because the texture genuinely isn't reaching the shader, vs some other bug
-		// in CloudIsoVolumeLowRes itself once the texture is confirmed bound.
+		// in SampleDensity itself once the texture is confirmed bound.
 		OutColor = (bHasBaseShapeNoiseTexture != 0u) ? float4(0., 1., 0., 1.) : float4(1., 0., 0., 1.);
 		return;
 	case 5u:
@@ -324,170 +247,183 @@ void MainPS(
 		// using a naive dominant-axis (cube-face-like) projection. Isolates whether this specific texture
 		// shows visible tile repetition / cube-projection distortion at this scale, independent of the
 		// CloudGlobalCoverageMap cube bake and its own (potentially different) projection.
-		const float2 TiledWeatherMap = SampleTiledCoverage(DirectionFromPlanetCenter, OuterSurfacePosition);
+		const float4 TiledWeatherMap = SampleTiledCoverage(DirectionFromPlanetCenter, OuterSurfacePosition);
 		OutColor = float4(TiledWeatherMap.rrr, 1.0);
 		return;
 	}
 	case 2u:
 	{
-		// RAYMARCH CODE------------------------------------------------------------------------
+		// RAYMARCH CODE — ported verbatim from HorizonClouds' verified MainPS (same structure the reference
+		// VolumetricClouds plugin uses), adapted from box-local RayPos to sphere-shell t/direction. See
+		// HorizonClouds.usf for the original.
 		const float SegmentLength = tRaymarchExit - tRaymarchEnter;
 		if (SegmentLength <= 0.0)
 		{
-			OutColor = float4(0., 0., 0., 1.0);
+			OutColor = float4(0., 0., 0., 0.0);
 			return;
 		}
 
 		const float ShellThickness = OuterRadius - InnerRadius;
 		const int StepCount = FindStepCount(SegmentLength, ShellThickness);
-		// Was: OrgStepSize = SegmentLength / StepCount — step size scaled with total ray length, same class
-		// of bug fixed in HorizonClouds (a long/grazing SegmentLength forces huge steps regardless of how
-		// fine the noise actually is). Now that BaseShapeFrequency resolves 2km puffs, that old formula
-		// aliases badly — the thin spiky streaks and sparse scattered marks are undersampling, not a
-		// coverage problem. Fixed step size instead, tied to the verified puff scale (200,000 UU / 8 =
-		// 25,000 UU = 25m — a fraction of a single puff, not of the whole segment), falling back to the old
-		// segment-divided formula only for short segments where a 25m step would be coarser than the
-		// segment itself. StepCount still sets the iteration budget via MaxIterations below.
-		const float FixedStepSize = 25000.0;
-		const float OrgStepSize = (SegmentLength >= FixedStepSize * 2.0) ? FixedStepSize : ((SegmentLength / StepCount) * 2.0);
-		float StepSize = OrgStepSize;
-		// Was: a Density-weighted post-hoc average (WeightedLight/AccumDensity) — reverted from a full
-		// SigmaT-based analytic integrator earlier this session because THAT blew up (saturate() turned
-		// per-step spikes into solid white patches). This is a different, simpler technique: standard
-		// front-to-back alpha compositing (the "over" operator), verified against the purchased
-		// VolumetricClouds plugin's actual M_VolumetricClouds.uasset material (Transmittance *= 1-DensitySample
-		// per step, LightEnergy += Transmittance*Density*Light). It's numerically safe here because Density is
-		// already saturate()-clamped to [0,1] everywhere upstream, so 1-Density can't go negative and
-		// Transmittance can only monotonically shrink — no exponential blow-up like the reverted attempt.
-		// A post-hoc average washes out per-step variation into one flat blended brightness for the whole ray,
-		// which is why the cloud read as flat with no internal shading — compositing keeps each step's
-		// contribution weighted by how much light could still reach the camera through everything already
-		// passed, which is what actually produces a sense of depth/form.
-		// Scalar, not float3 — Color/OutColor downstream is still a plain grayscale luminance value (no sky/sun
-		// color tinting yet, that's a separate, explicitly out-of-scope piece), so there's no RGB to carry.
-		float Transmittance = 1.0;
-		float AccumLight = 0.0;
 
-		// Was: hardcoded float3(0.4, 0.6, 0.7) — ResolvedView.AtmosphereLightDirection[0] read black despite a
-		// correctly-configured Directional Light (that field needs a SkyAtmosphere component to populate).
-		// PrimaryView.DirectionalLightDirection is set directly from the scene's directional light instead.
-		// TEMPORARY test: back to hardcoded, to isolate whether the lack of shading is the light march itself
-		// or specifically PrimaryView.DirectionalLightDirection being zero/NaN.
-		const float3 SunDirection = normalize(float3(1.0, 1.0, 1.0));
-		const float CosAngle = dot(RayDirection, SunDirection); // constant along the whole ray
-		const float HGPeak = HenyeyGreenstein(1.0, 0.2);
+		const int RayMaxSteps = StepCount;
+		const int ShadowMaxSteps = 8;
+		const float StepScaleDistance = 5000000.; // 500000.0;
+		const float MipMapScaleDistance = 100000000.0;
+		const float LightStepScale = 2.0;
 
-		// Iteration is a plain integer safety net, independent of t: for near-tangent rays SegmentLength (and
-		// so StepSize) can be tiny, and if t is large enough that t + StepSize rounds back to t in float32,
-		// t never advances and "t < tRaymarchExit" alone would loop forever (GPU hang / driver crash).
-		// Iteration always increases by exactly 1 regardless of what t does, so it guarantees the loop ends.
-		int Iteration = 0;
-		// YVAN's fine-stepping (halve on hit, double on miss, both bounded relative to OrgStepSize) needs more
-		// iterations than a plain coarse-only march to actually resolve density once found.
-		const int MaxIterations = StepCount * 4;
-		int ZeroDensityHitCount = 0;
+		const float BeerLawDensity = 0.85;
+		const float AttenClampIntensity = 0.6;
+		const float CloudOutScatterAmbient = 1.0;
+		const float InScatter = 0.75;
+		const float InScatterIntensity = 0.05;
+		const float SilverLightExp = 1.0;
+		const float SilverLightIntensity = 0.5;
+		const float OutScatter = -0.045;
+		const float InOutScatterLerp = 0.5;
+		const float LightColorIntensity = 1.25;
+		const float LightIntensity = 4.0;
+		const float LightPow = 3.0;
+		const float3 LightColor = float3(1.14, 1.22, 1.31) * LightColorIntensity;
+		const float3 ShadowColor = float3(0.60, 0.63, 0.7);
 
-		// Per-pixel start jitter (same mechanism as HorizonClouds): without it, the fixed 25m step lattice
-		// samples the noise texture at exactly the same phase every ray, beating against the texture's own
-		// texel grid (~15.6m base, ~5.4m detail) and producing uniform TV-static speckle instead of coherent
-		// shape. Offsetting the starting t by a random fraction of one step decorrelates adjacent pixels.
+		const float AtmosphereBlendDistance = 1000000000.0;
+		const float AtmosphereBlendIntensity = 1.0;
+		const float3 AtmosphereFogColor = float3(0.5, 0.6, 0.7);
+
+		// Reused from HorizonClouds' verified material-instance value — not yet independently verified for
+		// OrbisClouds' own scene, since there's no real scene directional light wired here yet.
+		const float3 LightDir = float3(0.492453, -0.086837, 0.865996);
+
+		// Near/far cascaded step budget: fixed 40km/500 step (matching TilingCoverageTileSize's own 40km
+		// reference scale) for the first 500 iterations, then a coarser step for whatever budget remains up
+		// to MaxIterations. Near phase resolves puff-scale detail close to the camera; far phase exists
+		// purely to let grazing/horizon-tangent rays actually reach the shell within a bounded iteration
+		// count, at the cost of resolution out there (same "thin screen-space strip, cheap to under-sample"
+		// reasoning as HorizonClouds' own step-size inflation).
+		const int NearPhaseSteps = 500;
+		const float NearStepSize = 4000000.0 / 500.0; // 8,000 UU = 8m
+		const float FarStepMultiplier = 8.0;		  // untuned starting guess — widen/narrow once tested at grazing angles
+		const float FarStepSize = NearStepSize * FarStepMultiplier;
+
 		const int3 JitterRandPos = int3(SvPosition.xy, View.StateFrameIndexMod8);
 		const float Jitter = float(Rand3DPCG16(JitterRandPos).x) / 65536.0;
-		const float tJittered = tRaymarchEnter + Jitter * StepSize;
+		float t = tRaymarchEnter + Jitter * NearStepSize;
 
-		for (float t = tJittered; t < tRaymarchExit && Iteration < MaxIterations; t += StepSize, Iteration++)
+		// t already IS distance-from-camera on this ray parametrization, unlike HorizonClouds' box-local
+		// RayPos which needed length((RayPos-LocalRayOrigin).xy) to recover that distance. Computed once from
+		// the entry point, same as HorizonClouds, then applied to whichever phase's base step is active.
+		const float StepDistanceScale = clamp((t - StepScaleDistance) / StepScaleDistance, 0.0, 10.0);
+
+		const float DotLight = dot(RayDirection, normalize(LightDir));
+
+		float Transmittance = 1.0;
+		float3 LightEnergy = 0.0;
+		bool bZeroSample = false;
+		float AtmosphereT = -1.0;
+
+		const int MaxIterations = RayMaxSteps * 4;
+
+		for (int Iteration = 0; Iteration < MaxIterations && t < tRaymarchExit; Iteration++)
 		{
+			const float PhaseStepSize = (Iteration < NearPhaseSteps) ? NearStepSize : FarStepSize;
+			const float StepSize = PhaseStepSize + PhaseStepSize * StepDistanceScale;
+
 			const float Radius = SampleRadiusAlongRay(t, RayDirection, PlanetCenterRelative);
-			const float HeightFromBottom = (Radius - InnerRadius);
-			const float HeightGradient = HeightFromBottom / ShellThickness;
-			if (HeightGradient < 0.0 || HeightGradient > 1.0)
+			const float HeightGradient = (Radius - InnerRadius) / ShellThickness;
+
+			float DensitySample = 0.0;
+			float3 DirectionFromPlanetCenterAtStep = 0.0;
+			float3 SamplePosition = 0.0;
+			float MipMapDistanceScale = min(floor(t / MipMapScaleDistance), 5.0);
+
+			if (HeightGradient >= 0.0 && HeightGradient <= 1.0)
 			{
-				continue;
+				DirectionFromPlanetCenterAtStep = ComputePreciseDirectionFromPlanetCenter(RayDirection, t, PlanetCenterRelativeDF);
+				SamplePosition = DirectionFromPlanetCenterAtStep * InnerRadius;
+				DensitySample = SampleDensity(SamplePosition, DirectionFromPlanetCenterAtStep, HeightGradient, MipMapDistanceScale);
 			}
 
-			const float3 DirectionFromPlanetCenterAtStep = ComputePreciseDirectionFromPlanetCenter(RayDirection, t, PlanetCenterRelativeDF);
-			const float3 SamplePosition = DirectionFromPlanetCenterAtStep * InnerRadius;
-
-			WeatherMap = SampleTiledCoverage(DirectionFromPlanetCenterAtStep, SamplePosition);
-
-			float Density = CloudIsoVolumeLowRes(SamplePosition, InnerRadius, WeatherMap, HeightFromBottom, HeightGradient);
-
-			if (Density > 0.0)
+			if (DensitySample > 0.01)
 			{
-				// YVAN's fine-stepping: halve the step size on a hit, floored at OrgStepSize/8 so it can't
-				// shrink forever.
-				const float PreviousStepSize = StepSize;
-				StepSize = max(StepSize / 2.0, OrgStepSize / 8.0);
-				ZeroDensityHitCount = 0;
-
-				// First hit while still fully coarse: this coarse step already overshot the true entry
-				// boundary by up to a full OrgStepSize — step back and re-approach at the just-halved step
-				// instead of accumulating this coarse-resolution sample.
-				if (PreviousStepSize == OrgStepSize)
+				if (bZeroSample)
 				{
-					t -= PreviousStepSize;
-					continue;
-				}
+					bZeroSample = false;
+					t -= StepSize;
 
-				// Refine with the hi-res detail texture — only reached once genuinely in fine-stepping (the
-				// step-back case above already continued away), so the coarse search never pays for this.
-				Density = CloudHighRes(SamplePosition, Density, HeightGradient, WeatherMap.x);
-
-				float DensityAlongLight = 0.0;
-				float3 LightSamplePosition = SamplePosition;
-				const float LightStepSize = 3.0 * StepSize;
-				for (int LightStep = 0; LightStep < 6; LightStep++)
-				{
-					const float LightRadius = length(LightSamplePosition);
-					const float LightHeightGradient = saturate((LightRadius - InnerRadius) / ShellThickness);
-					float IsoVolumeTest = CloudIsoVolumeLowRes(LightSamplePosition, InnerRadius, WeatherMap, 0.0, LightHeightGradient);
-					if (IsoVolumeTest > 0.0)
+					const float RadiusBack = SampleRadiusAlongRay(t, RayDirection, PlanetCenterRelative);
+					const float HeightGradientBack = (RadiusBack - InnerRadius) / ShellThickness;
+					if (HeightGradientBack >= 0.0 && HeightGradientBack <= 1.0)
 					{
-						float LightDensity = CloudHighRes(LightSamplePosition, IsoVolumeTest, LightHeightGradient, WeatherMap.x);
-						DensityAlongLight += LightDensity;
+						MipMapDistanceScale = min(floor(t / MipMapScaleDistance), 5.0);
+						DirectionFromPlanetCenterAtStep = ComputePreciseDirectionFromPlanetCenter(RayDirection, t, PlanetCenterRelativeDF);
+						SamplePosition = DirectionFromPlanetCenterAtStep * InnerRadius;
+						DensitySample = SampleDensity(SamplePosition, DirectionFromPlanetCenterAtStep, HeightGradientBack, MipMapDistanceScale);
 					}
-					LightSamplePosition += SunDirection * LightStepSize;
 				}
 
-				const float BeersPowder = max(BeersLaw(DensityAlongLight), Powder(DensityAlongLight));
-				const float SunHighlight = HenyeyGreenstein(CosAngle, 0.2) / HGPeak;
+				float DensityToSun = 0.0;
+				float3 ShadowRayPos = SamplePosition;
+				const float3 ShadowStep = normalize(LightDir) * NearStepSize * LightStepScale;
+				for (int s = 0; s < ShadowMaxSteps; s++)
+				{
+					ShadowRayPos += ShadowStep;
+					const float ShadowRadius = length(ShadowRayPos);
+					const float ShadowHeightGradient = saturate((ShadowRadius - InnerRadius) / ShellThickness);
+					const float MipMapShadowScale = floor(s / 2);
+					DensityToSun += SampleDensity(ShadowRayPos, normalize(ShadowRayPos), ShadowHeightGradient, MipMapShadowScale);
+				}
 
-				const float Depth = pow(Density, lerp(0.5, 1.0, saturate(Remap(HeightGradient, 0.3, 0.9, 0.0, 1.0))));
+				const float AttenPrim = exp(-BeerLawDensity * DensityToSun);
+				const float AttenSec = exp(-BeerLawDensity * AttenClampIntensity) * 0.7;
+				const float SunAtten = Remap(DotLight, 0.0, 1.0, AttenSec, AttenSec * 0.5);
+				const float Atten = max(SunAtten, AttenPrim);
+
+				const float Depth = CloudOutScatterAmbient * pow(DensitySample, Remap(HeightGradient, 0.3, 0.9, 0.5, 1.0));
 				const float Vertical = pow(saturate(Remap(HeightGradient, 0.0, 0.3, 0.8, 1.0)), 0.8);
 				const float AmbientOutScatter = 1.0 - saturate(Depth * Vertical);
 
-				const float LightEnergy = BeersPowder * AmbientOutScatter * SunHighlight;
+				const float FirstHG = InScatterIntensity * ((1.0 - InScatter * InScatter) / pow(1.0 + InScatter * InScatter - 2.0 * InScatter * DotLight, 1.5)) / 4.0 * 3.1415;
+				const float SecondHG = SilverLightIntensity * pow(saturate(DotLight), SilverLightExp);
+				const float InScatterHG = max(FirstHG, SecondHG);
+				const float OutScatterHG = ((1.0 - OutScatter * OutScatter) / pow(1.0 + OutScatter * OutScatter - 2.0 * OutScatter * DotLight, 1.5)) / 4.0 * 3.1415;
+				const float SunHighlight = lerp(InScatterHG, OutScatterHG, InOutScatterLerp);
 
-				AccumLight += Transmittance * Density * LightEnergy;
-				Transmittance *= (1.0 - Density);
-				if (Transmittance < 0.01)
-				{
-					Transmittance = 0.0;
-					break;
-				}
+				const float3 Light = Atten * AmbientOutScatter * SunHighlight * LightIntensity * DensitySample * Transmittance;
+				LightEnergy += Light;
+				Transmittance *= (1.0 - DensitySample);
 			}
-			else if (StepSize < OrgStepSize)
+
+			if (AtmosphereT < 0.0)
 			{
-				// Marshmallow-style gating on top of YVAN's doubling: a single miss doesn't start reverting
-				// to coarse — only 10 consecutive misses (actually walking out of the cloud, not just a brief
-				// internal gap) does, to avoid a coarse silhouette bleeding through behind finer foreground
-				// detail ("big cloud behind small cloud").
-				ZeroDensityHitCount++;
-				if (ZeroDensityHitCount >= 10)
-				{
-					StepSize = min(StepSize * 2.0, OrgStepSize * 2.);
-				}
+				AtmosphereT = t;
+			}
+
+			if (DensitySample > 0.0)
+			{
+				t += StepSize;
+			}
+			else
+			{
+				t += StepSize * 2.0;
+				bZeroSample = true;
+			}
+
+			if (Transmittance <= 0.0)
+			{
+				Transmittance = 0.0;
+				break;
 			}
 		}
 		// raymarch end -------------------------------------------------------------------------------
 
-		// Opacity is what's left after Transmittance's multiplicative decay (1 = fully opaque, nothing of the
-		// background survives); AccumLight is already the fully-composited front-to-back light sum, not an
-		// average, so it's used directly rather than divided by anything.
-		const float Opacity = saturate(1.0 - Transmittance);
-		Color = saturate(AccumLight);
+		LightEnergy = pow(max(lerp(ShadowColor, LightColor, LightEnergy), 0.0), LightPow);
+		const float AtmosphereBlendLerp = saturate(((max(AtmosphereT, 0.0) / AtmosphereBlendDistance) - 0.5) * AtmosphereBlendIntensity);
+		LightEnergy = lerp(LightEnergy, AtmosphereFogColor, AtmosphereBlendLerp);
+
+		OutColor = float4(LightEnergy, 1.0 - Transmittance);
+		return;
 	}
-	break;
 	}
 	OutColor = float4(Color, Color, Color, 1.0);
 }
