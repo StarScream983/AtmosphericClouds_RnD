@@ -218,8 +218,8 @@ void ClipShellBySceneDepth(inout float tRaymarchEnter, inout float tRaymarchExit
 
 // RAYMARCHING OPTICAL DEPTH, DENSITY AND CLOUD SHAPES----------------------------------------------
 
-#define ZENITH_MARCH_MIN_STEPS 288	// 64
-#define HORIZON_MARCH_MAX_STEPS 512 // 128
+#define ZENITH_MARCH_MIN_STEPS 500	// 288
+#define HORIZON_MARCH_MAX_STEPS 512 // 512
 
 // Thin bottom/top fade bands into a flat 1.0 plateau (HZD slide silhouettes).
 float ThinEdgeFade(float h, float BottomEdge, float TopEdge)
@@ -263,12 +263,10 @@ float HeightPresetCumulonimbus(float h)
 	return ThinEdgeFade(hc, 0.06, 0.12);
 }
 
-// Camera-relative space: RayOrigin (camera) is 0, so outward radial "up" at the camera is normalize(-PlanetCenter).
-int FindStepCount(float3 RayDirection, float3 PlanetCenter)
+int FindStepCount(float SegmentLength, float ShellThickness)
 {
-	const float3 UpVector = normalize(-PlanetCenter); // planet center is input as relative to camera from SceneViewExtension
-	const float d = abs(dot(RayDirection, UpVector));
-	return (int)ceil(lerp((float)HORIZON_MARCH_MAX_STEPS, (float)ZENITH_MARCH_MIN_STEPS, d));
+	const float DistanceToSampleCountMax = max(ShellThickness * 3.0, 1.0);
+	return (int)ceil(lerp((float)ZENITH_MARCH_MIN_STEPS, (float)HORIZON_MARCH_MAX_STEPS, saturate(SegmentLength / DistanceToSampleCountMax)));
 }
 
 float AccumulateShellOpticalDepth(

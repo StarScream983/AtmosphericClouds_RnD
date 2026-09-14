@@ -50,4 +50,5 @@ struct FOrbisCloudsPlanetRenderData
 	// BuildPlanetRenderData. Null if no texture is assigned.
 	FTextureRHIRef BaseShapeNoiseTextureRHI;
 	FTextureRHIRef DetailNoiseTextureRHI;
+	FTextureRHIRef CurlNoiseTextureRHI;
 };

@@ -92,7 +92,7 @@ void FOrbisCloudsViewExtension::UpdateCoverageMap(FRDGBuilder& GraphBuilder, con
 											.SetFlags(ETextureCreateFlags::ShaderResource | ETextureCreateFlags::UAV);
 	CoverageMapRHI = RHICreateTexture(Desc);
 
-	FRDGTextureRef CoverageMapTexture = RegisterExternalTexture(GraphBuilder, CoverageMapRHI, TEXT("OrbisClouds.CoverageMap"));
+	FRDGTextureRef CloudGlobalCoverageMap = RegisterExternalTexture(GraphBuilder, CoverageMapRHI, TEXT("OrbisClouds.CoverageMap"));
 
 	FCloudCoverageMapCS::FParameters* ComputeParams = GraphBuilder.AllocParameters<FCloudCoverageMapCS::FParameters>();
 	ComputeParams->Resolution = PlanetForPass.CoverageMapResolution;
@@ -114,7 +114,7 @@ void FOrbisCloudsViewExtension::UpdateCoverageMap(FRDGBuilder& GraphBuilder, con
 	ComputeParams->CloudsTypeOctaves = PlanetForPass.CloudsTypeOctaves;
 	ComputeParams->CloudsTypeLacunarity = PlanetForPass.CloudsTypeLacunarity;
 	ComputeParams->CloudsTypeGain = PlanetForPass.CloudsTypeGain;
-	ComputeParams->OutCoverageMap = GraphBuilder.CreateUAV(CoverageMapTexture);
+	ComputeParams->OutCoverageMap = GraphBuilder.CreateUAV(CloudGlobalCoverageMap);
 
 	TShaderMapRef<FCloudCoverageMapCS> ComputeShader(GetGlobalShaderMap(FeatureLevel));
 	const uint32 GroupCount = FMath::DivideAndRoundUp(PlanetForPass.CoverageMapResolution, FCloudCoverageMapCS::ThreadGroupSize);
@@ -251,11 +251,17 @@ void FOrbisCloudsViewExtension::PrePostProcessPass_RenderThread(
 											 : GSystemTextures.GetVolumetricBlackDummy(GraphBuilder);
 	PassParameters->DetailNoiseSampler = TStaticSamplerState<SF_Bilinear, AM_Wrap, AM_Wrap, AM_Wrap>::GetRHI();
 
+	PassParameters->bHasCurlNoiseTexture = PlanetForPass.CurlNoiseTextureRHI.IsValid() ? 1u : 0u;
+	PassParameters->CurlNoiseTexture = PlanetForPass.CurlNoiseTextureRHI.IsValid()
+											? RegisterExternalTexture(GraphBuilder, PlanetForPass.CurlNoiseTextureRHI, TEXT("OrbisClouds.CurlNoise"))
+											: GSystemTextures.GetBlackDummy(GraphBuilder);
+	PassParameters->CurlNoiseSampler = TStaticSamplerState<SF_Bilinear, AM_Wrap, AM_Wrap, AM_Wrap>::GetRHI();
+
 	// CoverageMapRHI is a plain RHI resource that outlives this GraphBuilder, so it needs re-registering into
 	// this frame's graph even on frames UpdateCoverageMap didn't rebake it (RDG resources don't persist across
 	// FRDGBuilder instances the way the RHI resource itself does).
-	PassParameters->CoverageMapTexture = RegisterExternalTexture(GraphBuilder, CoverageMapRHI, TEXT("OrbisClouds.CoverageMap"));
-	PassParameters->CoverageMapSampler = TStaticSamplerState<SF_Bilinear, AM_Clamp, AM_Clamp, AM_Clamp>::GetRHI();
+	PassParameters->CloudGlobalCoverageMap = RegisterExternalTexture(GraphBuilder, CoverageMapRHI, TEXT("OrbisClouds.CoverageMap"));
+	PassParameters->CloudGlobalCoverageMapSampler = TStaticSamplerState<SF_Bilinear, AM_Clamp, AM_Clamp, AM_Clamp>::GetRHI();
 
 	PassParameters->View = View.ViewUniformBuffer;
 	PassParameters->RenderTargets[0] = Output.GetRenderTargetBinding();

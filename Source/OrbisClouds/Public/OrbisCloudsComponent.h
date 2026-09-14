@@ -3,6 +3,7 @@
 #include "CoreMinimal.h"
 #include "OrbisCloudsRenderTypes.h"
 #include "Components/SceneComponent.h"
+#include "Engine/Texture2D.h"
 #include "Engine/VolumeTexture.h"
 #include "OrbisCloudsComponent.generated.h"
 
@@ -25,6 +26,16 @@ enum class ECoverageMapResolution : uint8
 	Res2048 UMETA(DisplayName = "2048"),
 	Res4096 UMETA(DisplayName = "4096"),
 	Res8192 UMETA(DisplayName = "8192"),
+};
+
+// Resolution for the camera-recentered detail clipmaps (near/far raymarch density LOD planes) — a
+// narrower choice than ECoverageMapResolution since these are compute-shader-refreshed every time the
+// camera moves, not a one-off bake.
+UENUM(BlueprintType)
+enum class EClipmapResolution : uint8
+{
+	Res1024 UMETA(DisplayName = "1024"),
+	Res2048 UMETA(DisplayName = "2048"),
 };
 
 UCLASS(ClassGroup = (OrbisClouds), meta = (BlueprintSpawnableComponent, DisplayName = "Orbis Clouds Component"))
@@ -106,6 +117,9 @@ public:
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "OrbisClouds|Authored Textures")
 	TObjectPtr<UVolumeTexture> DetailNoiseTexture = nullptr;
 
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "OrbisClouds|Authored Textures")
+	TObjectPtr<UTexture2D> CurlNoiseTexture = nullptr;
+
 	// UU that one full tile of BaseShapeNoiseTexture covers — controls how large a single cloud puff reads as
 	// in world space. Exposed for live testing; was a hardcoded shader constant.
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "OrbisClouds|Authored Textures", meta = (ClampMin = "1.0"))
@@ -117,6 +131,22 @@ public:
 	// "final" value yet.
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "OrbisClouds|Cloud Coverage")
 	ECoverageMapResolution CoverageMapResolution = ECoverageMapResolution::Res2048;
+
+	// Near detail clipmap: fine-grained density/coverage LOD plane recentered on the camera every time it
+	// moves, covering this diameter (km) around it. Feeds the raymarch's near/fine stepping phase.
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "OrbisClouds|Detail Clipmap", meta = (ClampMin = "10.0", ClampMax = "100.0"))
+	float DetailClipmapNearDiameterKm = 40.f;
+
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "OrbisClouds|Detail Clipmap")
+	EClipmapResolution DetailClipmapNearResolution = EClipmapResolution::Res2048;
+
+	// Far detail clipmap: coarse density/coverage LOD plane covering a much larger diameter (km) around the
+	// camera, matching how far the raymarch's coarse/far stepping phase can actually reach.
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "OrbisClouds|Detail Clipmap", meta = (ClampMin = "100.0", ClampMax = "2000.0"))
+	float DetailClipmapFarDiameterKm = 500.f;
+
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "OrbisClouds|Detail Clipmap")
+	EClipmapResolution DetailClipmapFarResolution = EClipmapResolution::Res1024;
 
 	FOrbisCloudsPlanetRenderData BuildPlanetRenderData() const;
 	void NotifyChanged();

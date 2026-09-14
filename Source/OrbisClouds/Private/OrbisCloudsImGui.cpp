@@ -189,5 +189,53 @@ void OrbisCloudsImGui::Draw(UOrbisCloudsComponent *Component)
 	}
 
 	ImGui::End();
+
+	if (!ImGui::Begin("OrbisClouds - Detail Clipmaps"))
+	{
+		ImGui::End();
+		return;
+	}
+
+	if (!Component)
+	{
+		ImGui::TextUnformatted("No OrbisClouds component.");
+		ImGui::End();
+		return;
+	}
+
+	const char *ClipmapResolutionNames[] = {"1024", "2048"};
+
+	ImGui::TextUnformatted("Near Clipmap");
+
+	if (ImGui::DragFloat("Diameter (km)##ClipmapNear", &Component->DetailClipmapNearDiameterKm, 1.f, 10.f, 100.f, "%.1f"))
+	{
+		Component->DetailClipmapNearDiameterKm = FMath::Clamp(Component->DetailClipmapNearDiameterKm, 10.f, 100.f);
+		Component->NotifyChanged();
+	}
+
+	int32 ClipmapNearResolutionIndex = static_cast<int32>(Component->DetailClipmapNearResolution);
+	if (ImGui::Combo("Resolution##ClipmapNear", &ClipmapNearResolutionIndex, ClipmapResolutionNames, UE_ARRAY_COUNT(ClipmapResolutionNames)))
+	{
+		Component->DetailClipmapNearResolution = static_cast<EClipmapResolution>(ClipmapNearResolutionIndex);
+		Component->NotifyChanged();
+	}
+
+	ImGui::Separator();
+	ImGui::TextUnformatted("Far Clipmap");
+
+	if (ImGui::DragFloat("Diameter (km)##ClipmapFar", &Component->DetailClipmapFarDiameterKm, 10.f, 100.f, 2000.f, "%.1f"))
+	{
+		Component->DetailClipmapFarDiameterKm = FMath::Clamp(Component->DetailClipmapFarDiameterKm, 100.f, 2000.f);
+		Component->NotifyChanged();
+	}
+
+	int32 ClipmapFarResolutionIndex = static_cast<int32>(Component->DetailClipmapFarResolution);
+	if (ImGui::Combo("Resolution##ClipmapFar", &ClipmapFarResolutionIndex, ClipmapResolutionNames, UE_ARRAY_COUNT(ClipmapResolutionNames)))
+	{
+		Component->DetailClipmapFarResolution = static_cast<EClipmapResolution>(ClipmapFarResolutionIndex);
+		Component->NotifyChanged();
+	}
+
+	ImGui::End();
 #endif
 }
